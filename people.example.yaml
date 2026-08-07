@@ -5,6 +5,11 @@ github:
   org: YourOrg            # or list explicit repos instead:
   # repos: [YourOrg/api, YourOrg/web]
 
+  # The repository the dashboard opens on. Omit it to open on all of them.
+  # This is only the default for the UI's repository filter — sync always pulls
+  # everything the org/repos scope above covers.
+  mainRepo: YourOrg/main-app
+
 slack:
   # Empty = every channel you're a member of, plus all DMs with the people below.
   # A user token only reaches conversations you belong to, so anything said in a
@@ -16,6 +21,15 @@ slack:
 people:
   - id: example           # canonical id, used everywhere in the database
     name: Example Person
-    github: octocat       # GitHub login
+    # One GitHub login, or a list when they commit under more than one account:
+    #   github: [octocat, octocat-personal]
+    # Omit it entirely for someone with no GitHub presence.
+    github: octocat
     linear: ""            # Linear user UUID — see README for the lookup query
     slack: ""             # Slack user ID, e.g. U01ABCDEF
+    # Which days this person works. Drives the "hide weekends" toggle in the UI,
+    # which is applied per person: a Friday off in Tel Aviv is an ordinary
+    # working day in Berlin. Omit it and sunday-thursday is assumed.
+    #   sunday-thursday   weekend is Friday and Saturday
+    #   monday-friday     weekend is Saturday and Sunday
+    workWeek: sunday-thursday

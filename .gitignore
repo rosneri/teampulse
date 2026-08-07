@@ -9,3 +9,6 @@ people.yaml
 
 *.html
 !template*.html
+# The dashboard's entry point. Bun bundles from it, so a clone without it
+# cannot start the server.
+!src/ui/index.html

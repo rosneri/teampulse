@@ -1,0 +1,15 @@
+# Run the same checks as `bun run check` before anything leaves the machine.
+# Install with `bunx lefthook install` — `bun install` does it via the prepare script.
+pre-push:
+  parallel: true
+  jobs:
+    - name: typecheck
+      run: bun run typecheck
+
+    - name: lint
+      run: bunx oxlint src test
+
+    # Needs the Postgres container up: the suite runs against its own
+    # `<name>_test` database, which test/setup.ts creates and migrates.
+    - name: test
+      run: bun test

@@ -1,3 +1,4 @@
+import { arrivedViaPullRequest } from "../commitmessage";
 import type { Config, People } from "../config";
 import type { Activity } from "../types";
 import { classify } from "../worktype";
@@ -41,6 +42,20 @@ function scopeOf(cfg: Config): string {
   return ""; // unscoped: everything the token can see
 }
 
+/**
+ * Search takes a scope as a query fragment, but walking commits needs actual
+ * repository names. An unscoped config can't produce them — search can ask
+ * GitHub "everything this token sees", a commit listing cannot — so that case
+ * collects pull requests only.
+ */
+async function repositoriesOf(cfg: Config): Promise<string[]> {
+  const g = cfg.github;
+  if (g?.repos?.length) return g.repos;
+  if (!g?.org) return [];
+  const repositories: any[] = await gh(["api", `orgs/${g.org}/repos`, "--paginate"]);
+  return repositories.map((r) => String(r.full_name)).filter(Boolean);
+}
+
 /** "https://api.github.com/repos/acme/web" -> "acme/web" */
 function repoOf(item: any): string {
   return String(item.repository_url ?? "").split("/repos/")[1] ?? "";
@@ -61,9 +76,15 @@ export async function collectGithub(
   const prs = new Map<string, { repo: string; number: number }>();
 
   for (const person of people.all) {
-    if (!person.github) continue;
+    if (!person.githubLogins.length) continue;
 
-    const authored = await search(`is:pr author:${person.github} updated:>=${day} ${scope}`.trim());
+    // A person may commit under more than one login. Search each and credit them
+    // all to the same canonical id, deduplicating on the event id downstream.
+    const authored: any[] = [];
+    for (const login of person.githubLogins) {
+      authored.push(...(await search(`is:pr author:${login} updated:>=${day} ${scope}`.trim())));
+    }
+
     for (const item of authored) {
       const repo = repoOf(item);
       if (repo) prs.set(`${repo}#${item.number}`, { repo, number: item.number });
@@ -90,10 +111,12 @@ export async function collectGithub(
     // Reviews the team gave on PRs they did not author — discovered here, but the
     // events themselves come from the reviews endpoint below so the timestamps are
     // real submission times rather than the PR's coarse updated_at.
-    const reviewed = await search(`is:pr reviewed-by:${person.github} updated:>=${day} ${scope}`.trim());
-    for (const item of reviewed) {
-      const repo = repoOf(item);
-      if (repo) prs.set(`${repo}#${item.number}`, { repo, number: item.number });
+    for (const login of person.githubLogins) {
+      const reviewed = await search(`is:pr reviewed-by:${login} updated:>=${day} ${scope}`.trim());
+      for (const item of reviewed) {
+        const repo = repoOf(item);
+        if (repo) prs.set(`${repo}#${item.number}`, { repo, number: item.number });
+      }
     }
   }
 
@@ -119,6 +142,75 @@ export async function collectGithub(
         title: `review on ${repo}#${number}`,
         meta: { repo, number, state: r.state },
       });
+    }
+  }
+
+  out.push(...(await collectCommits(cfg, people, since)));
+
+  return out;
+}
+
+const MAX_COMMIT_PAGES = 50; // 5000 commits per repository per sync
+
+/**
+ * Work that reached the default branch without a pull request — on a team that
+ * pushes straight to master, this is most of what gets built, and counting only
+ * pull requests makes those people look idle.
+ *
+ * Commits that arrived through a merged pull request are skipped so they are not
+ * counted twice alongside the `pr_merged` row for the same work.
+ * ponytail: that skip reads the merge's shape and GitHub's default message. A
+ * rebase-merged pull request whose commits were rewritten with custom messages
+ * leaves no trace to match on and will be counted twice; if that starts
+ * mattering, resolve each commit through `repos/{repo}/commits/{sha}/pulls`.
+ */
+async function collectCommits(cfg: Config, people: People, since: Date): Promise<Activity[]> {
+  const out: Activity[] = [];
+
+  for (const repository of await repositoriesOf(cfg)) {
+    for (let page = 1; page <= MAX_COMMIT_PAGES; page++) {
+      let commits: any[];
+      try {
+        // No `sha` parameter: GitHub defaults to the repository's default branch,
+        // which is exactly the "did this ship" line we want.
+        commits = await gh([
+          "api", "-X", "GET", `repos/${repository}/commits`,
+          "-f", `since=${since.toISOString()}`,
+          "-f", `per_page=${PER_PAGE}`,
+          "-f", `page=${page}`,
+        ]);
+      } catch {
+        break; // empty repository, lost access, transient — one repository is not worth failing the sync
+      }
+
+      for (const commit of commits) {
+        const message = String(commit.commit?.message ?? "");
+        const subject = message.split("\n")[0] ?? "";
+        if (arrivedViaPullRequest(subject, commit.parents?.length ?? 0)) continue;
+
+        const login = commit.author?.login?.toLowerCase();
+        const personId = login && people.byGithub.get(login);
+        if (!personId) continue;
+
+        // Committer date, not author date: it is what `since` filters on, so a
+        // rebased commit cannot land in the page yet fall outside the window.
+        const ts = commit.commit?.committer?.date ?? commit.commit?.author?.date;
+        if (!ts || new Date(ts) < since) continue;
+
+        out.push({
+          id: `github:commit_pushed:${repository}@${commit.sha}`,
+          source: "github",
+          type: "commit_pushed",
+          personId,
+          workType: classify(subject, []),
+          ts,
+          url: commit.html_url,
+          title: subject,
+          meta: { repo: repository, sha: commit.sha },
+        });
+      }
+
+      if (commits.length < PER_PAGE) break;
     }
   }
 

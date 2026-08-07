@@ -1,0 +1,19 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": ["typescript", "react", "jsx-a11y", "import", "unicorn"],
+  "categories": {
+    "correctness": "error",
+    "suspicious": "warn",
+    "perf": "warn"
+  },
+  "rules": {
+    "eslint/no-unused-vars": "error",
+
+    "typescript/no-explicit-any": "warn",
+
+    "react/react-in-jsx-scope": "off",
+
+    "eslint/no-await-in-loop": "off"
+  },
+  "ignorePatterns": ["src/generated/**", "node_modules/**", "prisma/**"]
+}
