@@ -4,7 +4,7 @@ import { classify } from "../worktype";
 
 const ENDPOINT = "https://api.linear.app/graphql";
 
-async function linear<T = any>(query: string, variables: Record<string, unknown>): Promise<T> {
+async function linear<T>(query: string, variables: Record<string, unknown>): Promise<T> {
   const key = process.env.LINEAR_API_KEY;
   if (!key) throw new Error("LINEAR_API_KEY not set");
 
@@ -19,15 +19,25 @@ async function linear<T = any>(query: string, variables: Record<string, unknown>
   return json.data;
 }
 
+type RelayConnection<T> = {
+  nodes: T[];
+  pageInfo: { hasNextPage: boolean; endCursor: string | null };
+};
+
 /** Walks a Relay connection to the end. */
-async function paginate<T>(query: string, vars: Record<string, unknown>, field: string): Promise<T[]> {
+async function paginate<T>(
+  query: string,
+  variables: Record<string, unknown>,
+  field: string,
+): Promise<T[]> {
   const nodes: T[] = [];
   let after: string | null = null;
   do {
-    const data = await linear(query, { ...vars, after });
-    const conn = data[field];
-    nodes.push(...conn.nodes);
-    after = conn.pageInfo.hasNextPage ? conn.pageInfo.endCursor : null;
+    const data: Record<string, RelayConnection<T>> = await linear(query, { ...variables, after });
+    const connection: RelayConnection<T> | undefined = data[field];
+    if (!connection) throw new Error(`linear: response has no "${field}" field`);
+    nodes.push(...connection.nodes);
+    after = connection.pageInfo.hasNextPage ? connection.pageInfo.endCursor : null;
   } while (after);
   return nodes;
 }

@@ -1,0 +1,11 @@
+[serve.static]
+plugins = ["bun-plugin-tailwind"]
+
+[test]
+preload = ["./test/setup.ts"]
+coverage = true
+coverageThreshold = 1.0
+coverageSkipTestFiles = true
+coverageReporter = ["text"]
+# Generated client code and the harness itself are not the code under test.
+coveragePathIgnorePatterns = ["src/generated/**", "test/**"]

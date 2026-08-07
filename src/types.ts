@@ -7,6 +7,8 @@ export type ActivityType =
   | "pr_opened"
   | "pr_merged"
   | "pr_reviewed"
+  /** Landed on a repository's default branch. Excludes anything that got there via a merged pull request. */
+  | "commit_pushed"
   // linear
   | "issue_created"
   | "issue_completed"
