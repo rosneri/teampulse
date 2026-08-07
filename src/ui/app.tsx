@@ -18,6 +18,7 @@ import {
 import { type ReactNode, useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 import type { BugRatio, Bucket, PersonStats, ReviewWait, TeamStats } from "../metrics";
+import { ACTIVITY_KINDS, kindOf } from "../activitykind";
 import { WORK_WEEK_LABELS, type WorkWeek, isWeekend, weekendDays } from "../workweek";
 import {
   ActivityChart, type DailyRow, DayShape, type DaySpan, HOURS_IN_DAY, HoursHeatmap,
@@ -25,7 +26,7 @@ import {
 } from "./charts";
 import {
   formatDayLabel, formatDuration, formatHourOfDay, formatHours, formatMinuteOfDay,
-  formatNumber, formatPercent, formatTimestamp,
+  formatMoney, formatNumber, formatPercent, formatTimestamp,
 } from "./format";
 import {
   BUILT_IN_VIEW, type SavedView, clearSavedView, readSavedView, sameView, writeSavedView,
@@ -33,7 +34,21 @@ import {
 
 /* ------------------------------------------------------------------ payloads */
 
-type PersonReference = { id: string; name: string; workWeek: WorkWeek };
+// "anthropic" is Claude Code. It is not an activity source — it has its own
+// table — but it is a source a person can be missing from, which is the only
+// thing the coverage table asks.
+const TRACKED_SOURCES = [
+  "github", "linear", "slack", "notion", "calendar", "vercel", "anthropic",
+] as const;
+type TrackedSource = (typeof TRACKED_SOURCES)[number];
+
+type PersonReference = {
+  id: string;
+  name: string;
+  workWeek: WorkWeek;
+  /** Which sources this person is even configured to appear in. */
+  handles: Record<TrackedSource, boolean>;
+};
 
 type StaleIssue = {
   person_id: string;
@@ -59,12 +74,52 @@ type TeamPayload = {
   days: { person_id: string; day: string; n: number }[];
   hours: { person_id: string; day_of_week: number; hour: number; n: number }[];
   sessions: DaySession[];
+  marks: DayMarkRow[];
   /** The silence that counts as a break, in minutes — the server's own threshold. */
   breakMinutes: number;
+  coverage: { person_id: string; source: string; events: number; last_seen: string | null }[];
+  syncs: { source: string; last_run: string }[];
+  ai: AiUsageRow[];
+  /** The newest judgment of each kind per person. Empty until somebody runs one. */
+  judgments: StoredJudgment[];
   ship: Bucket[];
   intake: Bucket[];
   bugs: BugRatio;
   stale: StaleIssue[];
+};
+
+/**
+ * A stored opinion, not a fact. Every timestamp arrives as a string because JSON
+ * has no date, and each row carries the window it judged rather than the window
+ * on screen — the two are only the same right after a run.
+ */
+type StoredJudgment = {
+  personId: string;
+  windowStart: string;
+  windowEnd: string;
+  createdAt: string;
+} & (
+  | { kind: "summary"; payload: { headline: string; themes: string[]; concerns: string[] } }
+  | {
+      kind: "work_type";
+      payload: {
+        proposals: {
+          activityId: string;
+          workType: string;
+          confidence: "low" | "medium" | "high";
+          reason: string;
+        }[];
+      };
+    }
+);
+
+type DayMarkRow = {
+  person_id: string;
+  day: string;
+  type: string;
+  started_minute: number;
+  ended_minute: number;
+  n: number;
 };
 
 type DaySession = {
@@ -73,6 +128,24 @@ type DaySession = {
   started_minute: number;
   ended_minute: number;
   events: number;
+};
+
+type AiUsageRow = {
+  person_id: string;
+  sessions: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cache_creation_tokens: number;
+  cost_amount: number;
+  currency: string;
+  lines_added: number;
+  lines_removed: number;
+  commits: number;
+  pull_requests: number;
+  tools_accepted: number;
+  tools_rejected: number;
+  days_used: number;
 };
 
 type TimelineEntry = {
@@ -265,6 +338,7 @@ function buildHourRows(
 function buildDaySpans(
   sinceIso: string,
   sessions: DaySession[],
+  marks: DayMarkRow[],
   person: PersonReference,
   hideWeekends: boolean,
 ): DaySpan[] {
@@ -280,6 +354,24 @@ function buildDaySpans(
     byDate.set(session.day, day);
   }
 
+  const marksByDate = new Map<string, DaySpan["marks"]>();
+  for (const mark of marks) {
+    if (mark.person_id !== person.id) continue;
+    const kind = kindOf(mark.type);
+    // An event type nobody classified is dropped rather than drawn in a colour
+    // that means nothing — and KIND_OF is exhaustive, so this is unreachable
+    // until somebody adds a type and forgets the taxonomy.
+    if (!kind) continue;
+    const day = marksByDate.get(mark.day) ?? [];
+    day.push({
+      startMinute: mark.started_minute,
+      endMinute: mark.ended_minute,
+      kind,
+      count: mark.n,
+    });
+    marksByDate.set(mark.day, day);
+  }
+
   const firstDay = Date.parse(`${sinceIso.slice(0, 10)}T00:00:00Z`);
   const lastDay = Date.parse(`${new Date().toISOString().slice(0, 10)}T00:00:00Z`);
   const days: DaySpan[] = [];
@@ -287,15 +379,22 @@ function buildDaySpans(
   for (let time = firstDay; time <= lastDay; time += DAY_IN_MILLISECONDS) {
     const date = new Date(time).toISOString().slice(0, 10);
     if (hideWeekends && isWeekend(date, person.workWeek)) continue;
-    days.push({ date, sessions: byDate.get(date) ?? [] });
+    days.push({
+      date,
+      sessions: byDate.get(date) ?? [],
+      // Longest first, so a meeting never hides behind the commit inside it.
+      marks: (marksByDate.get(date) ?? []).toSorted(
+        (a, b) => b.endMinute - b.startMinute - (a.endMinute - a.startMinute),
+      ),
+    });
   }
 
-  return days.reverse();
+  return days.toReversed();
 }
 
 const median = (values: number[]): number | null => {
   if (!values.length) return null;
-  const sorted = [...values].sort((a, b) => a - b);
+  const sorted = values.toSorted((a, b) => a - b);
   const middle = Math.floor(sorted.length / 2);
   return sorted.length % 2 === 1
     ? sorted[middle]!
@@ -315,14 +414,14 @@ type DaySummary = {
  * The typical working day, over the days the person actually worked. Medians, not
  * means: one all-nighter should not move where somebody's day usually starts.
  */
+const firstOf = (day: DaySpan) => day.sessions[0]!.startMinute;
+const lastOf = (day: DaySpan) => day.sessions[day.sessions.length - 1]!.endMinute;
+const activeOf = (day: DaySpan) =>
+  day.sessions.reduce((sum, session) => sum + (session.endMinute - session.startMinute), 0);
+
 function summarizeDays(days: DaySpan[]): DaySummary | null {
   const worked = days.filter((day) => day.sessions.length > 0);
   if (!worked.length) return null;
-
-  const firstOf = (day: DaySpan) => day.sessions[0]!.startMinute;
-  const lastOf = (day: DaySpan) => day.sessions[day.sessions.length - 1]!.endMinute;
-  const activeOf = (day: DaySpan) =>
-    day.sessions.reduce((sum, session) => sum + (session.endMinute - session.startMinute), 0);
 
   return {
     workedDays: worked.length,
@@ -627,7 +726,14 @@ function WeekendToggle({ checked, onChange }: { checked: boolean; onChange: (nex
 
 /* ---------------------------------------------------------------------- sync */
 
-type SyncResult = { label: string; collected: number; saved: number; error: string | null };
+type SyncResult = {
+  label: string;
+  collected: number;
+  saved: number;
+  error: string | null;
+  /** Set when the source was never called because it is not configured. */
+  skipped: string | null;
+};
 
 /**
  * The UI is the only controller, so pulling the sources lives here. The request
@@ -673,13 +779,177 @@ function SyncButton({ range, onFinished }: { range: string; onFinished: () => vo
         <ul className="text-xs text-ink-muted">
           {results.map((result) => (
             <li key={result.label} className={result.error ? "text-critical" : undefined}>
-              {result.error
-                ? `${result.label}: ${result.error}`
-                : `${result.label}: ${formatNumber(result.collected)} events, ${formatNumber(result.saved)} new`}
+              {/* A source nobody set up is not a failure, and must not wear the failure colour. */}
+              {result.skipped
+                ? `${result.label}: skipped — ${result.skipped}`
+                : result.error
+                  ? `${result.label}: ${result.error}`
+                  : `${result.label}: ${formatNumber(result.collected)} events, ${formatNumber(result.saved)} new`}
             </li>
           ))}
         </ul>
       ) : null}
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ judgment */
+
+/** What POST /api/judge answers with: one entry per person per kind, or the reason there isn't one. */
+type JudgeResult = { kind: string; personId: string; error?: string };
+
+/**
+ * The only thing on the page that spends money, which is why it is a button and
+ * not something a page load does. A run appends to `ai_output` and never touches
+ * `activity`, so nothing above this card can move because of it.
+ */
+function JudgeButton({ range, onFinished }: { range: string; onFinished: () => void }) {
+  const [running, setRunning] = useState(false);
+  const [failures, setFailures] = useState<JudgeResult[]>([]);
+  const [error, setError] = useState<string | null>(null);
+
+  async function runJudgment() {
+    setRunning(true);
+    setError(null);
+    try {
+      const response = await fetch(`/api/judge?since=${encodeURIComponent(range)}`, {
+        method: "POST",
+      });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload?.error ?? response.statusText);
+      // One person failing is reported and kept; the rest of the run still stands.
+      setFailures((payload.judgments as JudgeResult[]).filter((result) => result.error));
+      onFinished();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setRunning(false);
+    }
+  }
+
+  return (
+    <div className="flex flex-col items-end gap-1">
+      <button
+        type="button"
+        onClick={runJudgment}
+        disabled={running}
+        className="cursor-pointer rounded-full border border-hairline bg-surface px-4 py-2 text-sm text-ink-primary hover:border-[var(--series-1)] disabled:cursor-progress disabled:text-ink-muted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--series-1)]"
+      >
+        {running ? "Reading…" : "Run judgment"}
+      </button>
+
+      {error ? <p className="text-xs text-critical">{error}</p> : null}
+
+      {failures.map((failure) => (
+        <p key={`${failure.kind}:${failure.personId}`} className="text-xs text-critical">
+          {failure.personId} · {failure.kind}: {failure.error}
+        </p>
+      ))}
+    </div>
+  );
+}
+
+function JudgmentList({
+  people,
+  judgments,
+}: {
+  people: PersonReference[];
+  judgments: StoredJudgment[];
+}) {
+  const nameOf = new Map(people.map((person) => [person.id, person.name]));
+  // Only people something was actually said about, in roster order.
+  const judged = people.filter((person) =>
+    judgments.some((judgment) => judgment.personId === person.id),
+  );
+
+  if (!judged.length) {
+    return (
+      <p className="text-sm text-ink-muted">
+        Nothing judged yet. A run reads each person's events for the window on screen and asks
+        two questions about them.
+      </p>
+    );
+  }
+
+  return (
+    <div className="space-y-6">
+      {judged.map((person) => {
+        const forPerson = judgments.filter((judgment) => judgment.personId === person.id);
+        const summary = forPerson.find((judgment) => judgment.kind === "summary");
+        const workTypes = forPerson.find((judgment) => judgment.kind === "work_type");
+        // Both kinds carry a window; the summary is the one a reader reads first.
+        const stamped = summary ?? workTypes;
+
+        return (
+          <div key={person.id} className="border-b border-hairline pb-6 last:border-0 last:pb-0">
+            <div className="flex flex-wrap items-baseline justify-between gap-2">
+              <h3 className="text-sm font-semibold text-ink-primary">
+                {nameOf.get(person.id) ?? person.id}
+              </h3>
+              {stamped ? (
+                <p className="text-xs text-ink-muted tabular-nums">
+                  {stamped.windowStart.slice(0, 10)} → {stamped.windowEnd.slice(0, 10)} · judged{" "}
+                  {formatTimestamp(stamped.createdAt)}
+                </p>
+              ) : null}
+            </div>
+
+            {summary?.kind === "summary" ? (
+              <>
+                <p className="mt-2 text-sm text-ink-primary">{summary.payload.headline}</p>
+
+                {summary.payload.themes.length ? (
+                  <ul className="mt-3 flex flex-wrap gap-2">
+                    {summary.payload.themes.map((theme) => (
+                      <li
+                        key={theme}
+                        className="rounded-full border border-hairline px-3 py-1 text-xs text-ink-secondary"
+                      >
+                        {theme}
+                      </li>
+                    ))}
+                  </ul>
+                ) : null}
+
+                {summary.payload.concerns.length ? (
+                  <ul className="mt-3 space-y-1 text-xs text-ink-secondary">
+                    {summary.payload.concerns.map((concern) => (
+                      <li key={concern}>· {concern}</li>
+                    ))}
+                  </ul>
+                ) : null}
+              </>
+            ) : null}
+
+            {workTypes?.kind === "work_type" && workTypes.payload.proposals.length ? (
+              <div className="mt-4">
+                <p className="text-xs text-ink-muted">
+                  {formatNumber(workTypes.payload.proposals.length)} proposed work{" "}
+                  {workTypes.payload.proposals.length === 1 ? "type" : "types"}. Proposals only —
+                  Shipped and Intake above still count these as unclassified.
+                </p>
+                <table className="mt-2 w-full text-left text-xs">
+                  <tbody className="text-ink-secondary">
+                    {workTypes.payload.proposals.map((proposal) => (
+                      <tr
+                        key={proposal.activityId}
+                        className="border-b border-hairline last:border-0"
+                      >
+                        <td className="py-2 pr-3 font-medium text-ink-primary">
+                          {WORK_TYPE_ORDER.find((kind) => kind.key === proposal.workType)?.label ??
+                            proposal.workType}
+                        </td>
+                        <td className="px-3 py-2">{proposal.confidence} confidence</td>
+                        <td className="py-2 pl-3">{proposal.reason}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : null}
+          </div>
+        );
+      })}
     </div>
   );
 }
@@ -720,6 +990,50 @@ function ActivityTableView({ rows, series }: { rows: DailyRow[]; series: SeriesM
   );
 }
 
+function DayShapeTableView({ days }: { days: DaySpan[] }) {
+  return (
+    <table className="w-full text-left text-xs tabular-nums">
+      <thead className="sticky top-0 bg-surface text-ink-secondary">
+        <tr className="border-b border-hairline">
+          <th className="px-3 py-2 font-medium">Day</th>
+          <th className="px-3 py-2 font-medium">Blocks</th>
+          <th className="px-3 py-2 text-right font-medium">Span</th>
+          <th className="px-3 py-2 text-right font-medium">Active</th>
+          <th className="px-3 py-2 text-right font-medium">Events</th>
+        </tr>
+      </thead>
+      <tbody className="text-ink-primary">
+        {days.map((day) => {
+          const worked = day.sessions.length > 0;
+          const events = day.sessions.reduce((sum, session) => sum + session.events, 0);
+
+          return (
+            <tr key={day.date} className="border-b border-hairline last:border-0">
+              <td className="px-3 py-1.5 text-ink-secondary">{formatDayLabel(day.date)}</td>
+              <td className="px-3 py-1.5">
+                {/* Every block spelled out, so a break is a readable number and not only a gap. */}
+                {day.sessions.length
+                  ? day.sessions
+                      .map(
+                        (session) =>
+                          `${formatMinuteOfDay(session.startMinute)}–${formatMinuteOfDay(session.endMinute)}`,
+                      )
+                      .join("  ·  ")
+                  : <span className="text-ink-muted">no activity</span>}
+              </td>
+              <td className="px-3 py-1.5 text-right">
+                {worked ? formatDuration(lastOf(day) - firstOf(day)) : "—"}
+              </td>
+              <td className="px-3 py-1.5 text-right">{worked ? formatDuration(activeOf(day)) : "—"}</td>
+              <td className="px-3 py-1.5 text-right">{formatNumber(events)}</td>
+            </tr>
+          );
+        })}
+      </tbody>
+    </table>
+  );
+}
+
 function HoursTableView({ rows }: { rows: HoursRow[] }) {
   return (
     <table className="w-full text-left text-xs tabular-nums">
@@ -748,6 +1062,133 @@ function HoursTableView({ rows }: { rows: HoursRow[] }) {
             </td>
           </tr>
         ))}
+      </tbody>
+    </table>
+  );
+}
+
+function CoverageTable({
+  people,
+  coverage,
+  syncs,
+}: {
+  people: PersonReference[];
+  coverage: TeamPayload["coverage"];
+  syncs: TeamPayload["syncs"];
+}) {
+  const counts = new Map(coverage.map((row) => [`${row.person_id}:${row.source}`, row.events]));
+  const lastRun = new Map(syncs.map((row) => [row.source, row.last_run]));
+
+  return (
+    <>
+      <table className="w-full text-left text-sm">
+        <thead className="text-xs text-ink-secondary">
+          <tr className="border-b border-hairline">
+            <th className="py-2 pr-3 font-medium">Person</th>
+            {TRACKED_SOURCES.map((source) => (
+              <th key={source} className="px-3 py-2 text-right font-medium">
+                {/* Days used, not events: the report is daily and has no clock. */}
+                {source === "anthropic" ? "claude code (days)" : source}
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody className="tabular-nums text-ink-primary">
+          {people.map((person) => (
+            <tr key={person.id} className="border-b border-hairline last:border-0">
+              <td className="py-2 pr-3">{person.name}</td>
+              {TRACKED_SOURCES.map((source) => {
+                const events = counts.get(`${person.id}:${source}`) ?? 0;
+                // Three states, and they mean different things: a number is
+                // coverage, "0" is a configured source that said nothing, and
+                // "not set up" is a source that was never going to say anything.
+                if (!person.handles[source]) {
+                  return (
+                    <td key={source} className="px-3 py-2 text-right text-xs text-critical">
+                      not set up
+                    </td>
+                  );
+                }
+                return (
+                  <td
+                    key={source}
+                    className={`px-3 py-2 text-right ${events ? "" : "text-ink-muted"}`}
+                  >
+                    {formatNumber(events)}
+                  </td>
+                );
+              })}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+
+      <p className="mt-4 text-xs text-ink-muted">
+        Last sync —{" "}
+        {TRACKED_SOURCES.map((source) => {
+            const run = lastRun.get(source);
+            return `${source}: ${run ? formatTimestamp(run) : "never"}`;
+          })
+          .join(" · ")}
+      </p>
+    </>
+  );
+}
+
+const totalTokens = (row: AiUsageRow) =>
+  row.input_tokens + row.output_tokens + row.cache_read_tokens + row.cache_creation_tokens;
+
+function AiUsageTable({ people, usage }: { people: PersonReference[]; usage: AiUsageRow[] }) {
+  const byPerson = new Map(usage.map((row) => [row.person_id, row]));
+
+  return (
+    <table className="w-full text-left text-sm">
+      <thead className="text-xs text-ink-secondary">
+        <tr className="border-b border-hairline">
+          <th className="py-2 pr-3 font-medium">Person</th>
+          <th className="px-3 py-2 text-right font-medium">Days used</th>
+          <th className="px-3 py-2 text-right font-medium">Sessions</th>
+          <th className="px-3 py-2 text-right font-medium">Tokens</th>
+          <th className="px-3 py-2 text-right font-medium">Cost</th>
+          <th className="px-3 py-2 text-right font-medium">Lines +/−</th>
+          <th className="py-2 pl-3 text-right font-medium">Edits accepted</th>
+        </tr>
+      </thead>
+      <tbody className="tabular-nums text-ink-primary">
+        {people.map((person) => {
+          const row = byPerson.get(person.id);
+          // A row of dashes reads as a broken card. Say which of the two silences
+          // this is: nobody by that address in the report, or no address to
+          // match on in the first place.
+          if (!row) {
+            return (
+              <tr key={person.id} className="border-b border-hairline last:border-0">
+                <td className="py-2 pr-3">{person.name}</td>
+                <td colSpan={6} className="px-3 py-2 text-right text-xs text-ink-muted">
+                  {person.handles.anthropic
+                    ? "no usage under this address in the Anthropic report"
+                    : "no email in people.yaml — usage cannot be attributed"}
+                </td>
+              </tr>
+            );
+          }
+          const proposed = row.tools_accepted + row.tools_rejected;
+          return (
+            <tr key={person.id} className="border-b border-hairline last:border-0">
+              <td className="py-2 pr-3">{person.name}</td>
+              <td className="px-3 py-2 text-right">{formatNumber(row.days_used)}</td>
+              <td className="px-3 py-2 text-right">{formatNumber(row.sessions)}</td>
+              <td className="px-3 py-2 text-right">{formatNumber(totalTokens(row))}</td>
+              <td className="px-3 py-2 text-right">{formatMoney(row.cost_amount, row.currency)}</td>
+              <td className="px-3 py-2 text-right text-ink-secondary">
+                {formatNumber(row.lines_added)} / {formatNumber(row.lines_removed)}
+              </td>
+              <td className="py-2 pl-3 text-right">
+                {proposed ? formatPercent(row.tools_accepted / proposed) : "—"}
+              </td>
+            </tr>
+          );
+        })}
       </tbody>
     </table>
   );
@@ -826,6 +1267,9 @@ function PeopleTable({
     </table>
   );
 }
+
+/** Days drawn in the day-shape card. The rest stay one click away in the table view. */
+const DAYS_SHOWN = 14;
 
 const STALE_ISSUES_SHOWN = 15;
 
@@ -987,6 +1431,9 @@ function App() {
   const [hideWeekends, setHideWeekends] = useState(openingView.hideWeekends);
   const [repository, setRepository] = useState(openingView.repository);
   const [selectedPersonId, setSelectedPersonId] = useState<string | null>(null);
+  // Whose day the shape card shows. Null until the roster arrives; the first
+  // person in people.yaml then stands in until the reader picks somebody.
+  const [dayShapePersonId, setDayShapePersonId] = useState<string | null>(null);
   const [reloadToken, setReloadToken] = useState(0);
 
   const currentView: SavedView = { range, repository, hideWeekends };
@@ -1012,6 +1459,25 @@ function App() {
     () => (data ? buildHourRows(data.hours, data.people, hideWeekends) : []),
     [data, hideWeekends],
   );
+
+  const dayShapePerson =
+    data?.people.find((person) => person.id === dayShapePersonId) ?? data?.people[0] ?? null;
+  const daySpans = useMemo(
+    () =>
+      data && dayShapePerson
+        ? buildDaySpans(data.since, data.sessions, data.marks, dayShapePerson, hideWeekends)
+        : [],
+    [data, dayShapePerson, hideWeekends],
+  );
+  const daySummary = useMemo(() => summarizeDays(daySpans), [daySpans]);
+
+  // Only the kinds this person actually produced get a legend entry — a legend
+  // listing seven kinds when four are on screen is a legend for a different chart.
+  const kindsInUse = useMemo(() => {
+    const present = new Set(daySpans.flatMap((day) => day.marks.map((mark) => mark.kind)));
+    return ACTIVITY_KINDS.filter((kind) => present.has(kind));
+  }, [daySpans]);
+  const shownDays = daySpans.slice(0, DAYS_SHOWN);
 
   // Name the calendars in play, so "weekend" is never left to the reader to guess.
   const workWeeksInUse = data
@@ -1108,6 +1574,48 @@ function App() {
             <HoursHeatmap rows={hourRows} />
           </Card>
 
+          {dayShapePerson ? (
+            <Card
+              title="Day shape"
+              description={
+                `Every working day, and where the work actually fell in it — in ${data.timezone}. ` +
+                "The pale band is the stretch they were going and the gaps between bands are the breaks; " +
+                "the colours say what the work was. Meetings are the only events with a real length — " +
+                "everything else is an instant, so an hour spent reading code emits nothing and reads as lunch."
+              }
+              tableView={<DayShapeTableView days={daySpans} />}
+            >
+              <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+                <PersonFilter
+                  people={data.people}
+                  value={dayShapePerson.id}
+                  onChange={setDayShapePersonId}
+                />
+                {daySummary ? (
+                  <p className="text-xs text-ink-secondary tabular-nums">
+                    Typical day{" "}
+                    <span className="font-semibold text-ink-primary">
+                      {formatMinuteOfDay(daySummary.startMinute)} →{" "}
+                      {formatMinuteOfDay(daySummary.endMinute)}
+                    </span>{" "}
+                    · {formatDuration(daySummary.spanMinutes)} start to finish ·{" "}
+                    {formatDuration(daySummary.activeMinutes)} inside blocks ·{" "}
+                    {formatNumber(daySummary.sessions)} blocks · over{" "}
+                    {formatNumber(daySummary.workedDays)} worked days
+                  </p>
+                ) : null}
+              </div>
+
+              <DayShape days={shownDays} breakMinutes={data.breakMinutes} kinds={kindsInUse} />
+
+              {daySpans.length > shownDays.length ? (
+                <p className="mt-3 text-xs text-ink-muted">
+                  {formatNumber(daySpans.length - shownDays.length)} earlier days not shown.
+                </p>
+              ) : null}
+            </Card>
+          ) : null}
+
           <div className="grid gap-6 md:grid-cols-2">
             <Card title="Shipped" description="Merged pull requests by kind of work.">
               <MixBar
@@ -1146,6 +1654,48 @@ function App() {
                 caption={`${formatPercent(data.bugs.fix_share)} of merged pull requests were fixes rather than new work.`}
               />
             </div>
+          </Card>
+
+          <Card
+            title="Claude Code"
+            description={
+              "What Claude Code cost and produced per person, from Anthropic's usage report. " +
+              "Reported by whole day, so this card has no time of day and never feeds the charts above. " +
+              "Only people whose work email is in people.yaml can be credited; a shared API key is nobody."
+            }
+          >
+            <AiUsageTable people={data.people} usage={data.ai} />
+          </Card>
+
+          <Card
+            title="Judgment"
+            description={
+              "The one card on this page no number comes from. A model reads each person's events " +
+              "and says what the window was about, and proposes a kind of work for the merged PRs " +
+              "and issues nothing classified deterministically. It writes to ai_output only: every " +
+              "chart above stays exactly as it was, and an unclassified item stays unclassified."
+            }
+          >
+            <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
+              <p className="max-w-prose text-xs text-ink-muted">
+                Each run is stamped with a hash of exactly what the model was shown, so asking twice
+                about the same events answers from the first run rather than paying again.
+              </p>
+              <JudgeButton range={range} onFinished={() => setReloadToken((token) => token + 1)} />
+            </div>
+
+            <JudgmentList people={data.people} judgments={data.judgments} />
+          </Card>
+
+          <Card
+            title="Coverage"
+            description={
+              "How many events each source produced per person in this window. A configured source " +
+              "showing zero is either a quiet week or a blind spot — those look identical everywhere " +
+              "else on this page. Nothing here proves coverage; it only stops silence from passing for calm."
+            }
+          >
+            <CoverageTable people={data.people} coverage={data.coverage} syncs={data.syncs} />
           </Card>
 
           <Card title="People" description="Select a person for their stats and timeline.">

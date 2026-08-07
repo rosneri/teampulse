@@ -21,7 +21,18 @@ people:
     # Omit it entirely for someone with no GitHub presence.
     github: octocat
     linear: ""            # Linear user UUID — see README for the lookup query
-    slack: ""             # Slack user ID, e.g. U01ABCDEF
+    # Slack user ID, e.g. U01ABCDEF. A list when they post from more than one
+    # account: slack: [U01ABCDEF, U07GHIJKL]
+    slack: ""
+    notion: ""            # Notion user id (a UUID) — see README for the lookup
+    # Work email. Three things key off it, so it is the single most useful field
+    # here: whose calendar to read, who a Vercel deployment belongs to, and whose
+    # Claude Code usage the Anthropic report is describing.
+    email: ""
+    # Vercel username, only when it is not the local part of the email above.
+    # A list when they deploy from more than one account:
+    #   vercel: [octocat, octocat-personal]
+    # vercel: ""
     # Which days this person works. Drives the "hide weekends" toggle in the UI,
     # which is applied per person: a Friday off in Tel Aviv is an ordinary
     # working day in Berlin. Omit it and sunday-thursday is assumed.

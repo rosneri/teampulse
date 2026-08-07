@@ -3,8 +3,10 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { indexPeople, loadConfig, parseSince } from "./config";
 import { prisma } from "./db";
+import { storedJudgments } from "./judgment";
 import {
-  activityFeed, bugRatio, dailyCounts, hourlyCounts, intakeMix, personStats,
+  DEFAULT_BREAK_MINUTES, activityFeed, aiUsage, bugRatio, coverage, dailyCounts,
+  daySessions, dayMarks, hourlyCounts, intakeMix, lastSyncs, personStats,
   repositories, reviewWaits, shippedMix, staleIssues, teamStats,
 } from "./metrics";
 
@@ -129,6 +131,76 @@ server.registerTool(
 );
 
 server.registerTool(
+  "day_sessions",
+  {
+    description:
+      "Each person's day split into working blocks: when a block started, when it ended, and how many " +
+      "events fell inside it. Minutes are counted from local midnight. A block is only the visible edge " +
+      "of the work — events are instants, so quiet focus time reads the same as a break.",
+    inputSchema: {
+      ...windowInput,
+      timezone: z
+        .string()
+        .default("UTC")
+        .describe('IANA zone the hours are read in, e.g. "Asia/Jerusalem". Hours are stored in UTC.'),
+      break_minutes: z
+        .number()
+        .int()
+        .min(1)
+        .default(DEFAULT_BREAK_MINUTES)
+        .describe("A silence at least this long starts a new block."),
+    },
+    annotations: { readOnlyHint: true },
+  },
+  async ({ since, repository, timezone, break_minutes }) =>
+    asJson(await daySessions(parseSince(since), timezone, repository, break_minutes)),
+);
+
+server.registerTool(
+  "day_marks",
+  {
+    description:
+      "Every activity as a span in the reader's day: instants start and end on the same minute, and a " +
+      "meeting occupies its real length. Grouped per minute and event type. This is what the coloured " +
+      "day-shape chart is drawn from.",
+    inputSchema: { ...windowInput, timezone: z
+        .string()
+        .default("UTC")
+        .describe('IANA zone the hours are read in, e.g. "Asia/Jerusalem". Hours are stored in UTC.'), },
+    annotations: { readOnlyHint: true },
+  },
+  async ({ since, repository, timezone }) =>
+    asJson(await dayMarks(parseSince(since), timezone, repository)),
+);
+
+server.registerTool(
+  "coverage",
+  {
+    description:
+      "How many events each source produced per person in the window, plus when each source last ran. " +
+      "Use it before trusting a low number anywhere else: a configured source reporting zero is either a " +
+      "quiet week or a blind spot, and every other tool here reports them identically.",
+    inputSchema: { since: z.string().default("30d").describe(SINCE_DESCRIPTION) },
+    annotations: { readOnlyHint: true },
+  },
+  async ({ since }) =>
+    asJson({ coverage: await coverage(parseSince(since)), last_syncs: await lastSyncs() }),
+);
+
+server.registerTool(
+  "ai_usage",
+  {
+    description:
+      "Claude Code usage per person: sessions, tokens, estimated cost in minor units, lines written, and " +
+      "accepted versus rejected edits. Reported by whole calendar day, so it carries no time of day — " +
+      "never mix it into an hour-of-day answer. Only actors on API billing appear at all.",
+    inputSchema: { since: z.string().default("30d").describe(SINCE_DESCRIPTION) },
+    annotations: { readOnlyHint: true },
+  },
+  async ({ since }) => asJson(await aiUsage(parseSince(since))),
+);
+
+server.registerTool(
   "stale_issues",
   {
     description:
@@ -166,6 +238,23 @@ server.registerTool(
       await activityFeed({ personId: person_id, since: parseSince(since), limit, repository }),
     );
   },
+);
+
+server.registerTool(
+  "judgments",
+  {
+    description:
+      "The AI layer's stored opinions — the newest of each kind per person, from ai_output. This is " +
+      "the one tool here whose answers are not facts: a 'summary' is a model's reading of somebody's " +
+      "window, and a 'work_type' proposal is a guess at what unclassified merged PRs and created " +
+      "issues were. Proposals are never written back to activity, so shipped_mix and intake_mix keep " +
+      "reporting those items as unclassified — do not add these to a count or reconcile them against " +
+      "one. Each row carries the window it judged, which may be narrower or older than the one you " +
+      "are asking about, and the run that produced it. Nothing here can be produced by a model: only " +
+      "a person, through the dashboard, can spend a judgment call.",
+    annotations: { readOnlyHint: true },
+  },
+  async () => asJson(await storedJudgments()),
 );
 
 registerWindowedTool(

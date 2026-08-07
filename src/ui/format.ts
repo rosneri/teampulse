@@ -28,6 +28,10 @@ export const formatDuration = (minutes: number) => {
   return whole < 60 ? `${whole}m` : `${Math.floor(whole / 60)}h ${String(whole % 60).padStart(2, "0")}m`;
 };
 
+/** 186 cents -> "$1.86". Minor units in, because that is what the usage report reports. */
+export const formatMoney = (minorUnits: number, currency: string) =>
+  (minorUnits / 100).toLocaleString(undefined, { style: "currency", currency });
+
 /** "2026-07-27" -> "Mon 07-27". Read in UTC: the string is a calendar date, not an instant. */
 export const formatDayLabel = (isoDate: string) => {
   const weekday = new Date(`${isoDate}T00:00:00Z`).toLocaleDateString("en-US", {

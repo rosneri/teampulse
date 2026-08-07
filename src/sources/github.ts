@@ -73,7 +73,9 @@ export async function collectGithub(
   const day = since.toISOString().slice(0, 10);
   const scope = scopeOf(cfg);
   const out: Activity[] = [];
-  const prs = new Map<string, { repo: string; number: number }>();
+  // Every pull request and issue the searches touched, so comments can be fetched
+  // once per thread rather than once per person who spoke in it.
+  const prs = new Map<string, { repo: string; number: number; isPullRequest: boolean }>();
 
   for (const person of people.all) {
     if (!person.githubLogins.length) continue;
@@ -87,7 +89,7 @@ export async function collectGithub(
 
     for (const item of authored) {
       const repo = repoOf(item);
-      if (repo) prs.set(`${repo}#${item.number}`, { repo, number: item.number });
+      if (repo) prs.set(`${repo}#${item.number}`, { repo, number: item.number, isPullRequest: true });
 
       const workType = classify(item.title, labelsOf(item));
       const base = {
@@ -115,12 +117,13 @@ export async function collectGithub(
       const reviewed = await search(`is:pr reviewed-by:${login} updated:>=${day} ${scope}`.trim());
       for (const item of reviewed) {
         const repo = repoOf(item);
-        if (repo) prs.set(`${repo}#${item.number}`, { repo, number: item.number });
+        if (repo) prs.set(`${repo}#${item.number}`, { repo, number: item.number, isPullRequest: true });
       }
     }
   }
 
-  for (const { repo, number } of prs.values()) {
+  for (const { repo, number, isPullRequest } of prs.values()) {
+    if (!isPullRequest) continue;
     let reviews: any[];
     try {
       reviews = await gh(["api", `repos/${repo}/pulls/${number}/reviews`, "--paginate"]);
@@ -145,7 +148,227 @@ export async function collectGithub(
     }
   }
 
+  out.push(...(await collectIssues(cfg, people, since, prs)));
+  out.push(...(await collectComments(people, since, prs)));
   out.push(...(await collectCommits(cfg, people, since)));
+  out.push(...(await collectShipping(cfg, people, since)));
+
+  return out;
+}
+
+/**
+ * GitHub Issues. The searches above are `is:pr`, which excludes issues entirely —
+ * on a team that files bugs in GitHub rather than Linear, that was the whole
+ * intake side going missing.
+ *
+ * Creation is credited to the author and completion to the assignee, the same
+ * split the Linear collector uses: the person who closed it is not in the search
+ * payload, and the assignee is who did the work.
+ */
+async function collectIssues(
+  cfg: Config,
+  people: People,
+  since: Date,
+  items: Map<string, { repo: string; number: number; isPullRequest: boolean }>,
+): Promise<Activity[]> {
+  const day = since.toISOString().slice(0, 10);
+  const scope = scopeOf(cfg);
+  const out: Activity[] = [];
+
+  for (const person of people.all) {
+    if (!person.githubLogins.length) continue;
+
+    for (const login of person.githubLogins) {
+      for (const item of await search(`is:issue author:${login} created:>=${day} ${scope}`.trim())) {
+        const repo = repoOf(item);
+        if (repo) items.set(`${repo}#${item.number}`, { repo, number: item.number, isPullRequest: false });
+        if (!item.created_at || new Date(item.created_at) < since) continue;
+        out.push({
+          id: `github:issue_created:${item.id}`,
+          source: "github",
+          type: "issue_created",
+          personId: person.id,
+          workType: classify(item.title, labelsOf(item)),
+          ts: item.created_at,
+          url: item.html_url,
+          title: item.title,
+          meta: { repo, number: item.number },
+        });
+      }
+
+      for (const item of await search(`is:issue assignee:${login} closed:>=${day} ${scope}`.trim())) {
+        const repo = repoOf(item);
+        if (repo) items.set(`${repo}#${item.number}`, { repo, number: item.number, isPullRequest: false });
+        if (!item.closed_at || new Date(item.closed_at) < since) continue;
+        // "not planned" is a closure, not a delivery.
+        if (item.state_reason === "not_planned") continue;
+        out.push({
+          id: `github:issue_completed:${item.id}`,
+          source: "github",
+          type: "issue_completed",
+          personId: person.id,
+          workType: classify(item.title, labelsOf(item)),
+          ts: item.closed_at,
+          url: item.html_url,
+          title: item.title,
+          meta: { repo, number: item.number },
+        });
+      }
+    }
+  }
+
+  return out;
+}
+
+/**
+ * Comments on everything the searches above turned up. Two endpoints, because
+ * GitHub keeps them apart: `issues/{n}/comments` is the conversation tab of both
+ * issues and pull requests, and `pulls/{n}/comments` is the review threads on the
+ * diff. Review *threads* are where most of the actual reviewing gets said, and
+ * counting only submitted reviews missed all of it.
+ */
+async function collectComments(
+  people: People,
+  since: Date,
+  items: Map<string, { repo: string; number: number; isPullRequest: boolean }>,
+): Promise<Activity[]> {
+  const out: Activity[] = [];
+  const iso = since.toISOString();
+
+  const emit = (comment: any, repo: string, number: number, isPullRequest: boolean) => {
+    const login = comment.user?.login?.toLowerCase();
+    const personId = login && people.byGithub.get(login);
+    if (!personId || !comment.created_at) return;
+    if (new Date(comment.created_at) < since) return;
+    out.push({
+      id: `github:${isPullRequest ? "pr" : "issue"}_commented:${comment.id}`,
+      source: "github",
+      type: isPullRequest ? "pr_commented" : "issue_commented",
+      personId,
+      ts: comment.created_at,
+      url: comment.html_url,
+      title: `comment on ${repo}#${number}`,
+      body: comment.body,
+      meta: { repo, number },
+    });
+  };
+
+  for (const { repo, number, isPullRequest } of items.values()) {
+    try {
+      for (const comment of await gh([
+        "api", "-X", "GET", `repos/${repo}/issues/${number}/comments`,
+        "-f", `since=${iso}`, "--paginate",
+      ])) {
+        emit(comment, repo, number, isPullRequest);
+      }
+    } catch {
+      // deleted, private, transient — one thread is not worth failing the sync
+    }
+
+    if (!isPullRequest) continue;
+    try {
+      for (const comment of await gh([
+        "api", "-X", "GET", `repos/${repo}/pulls/${number}/comments`,
+        "-f", `since=${iso}`, "--paginate",
+      ])) {
+        emit(comment, repo, number, true);
+      }
+    } catch {
+      // as above
+    }
+  }
+
+  return out;
+}
+
+const MAX_SHIPPING_PAGES = 5;
+
+/**
+ * What reached an environment, and what a person started by hand.
+ *
+ * Deployments are somebody's decision to ship. Workflow runs mostly are not — a
+ * push-triggered build is the push, already counted as a commit — so only runs a
+ * person actually reached for are kept: a manual dispatch, or a re-run. Counting
+ * every automatic build would double every commit and drown the day-shape chart
+ * in events nobody performed.
+ */
+async function collectShipping(cfg: Config, people: People, since: Date): Promise<Activity[]> {
+  const out: Activity[] = [];
+  const day = since.toISOString().slice(0, 10);
+
+  for (const repository of await repositoriesOf(cfg)) {
+    // The deployments endpoint has no `since` filter — it is newest-first, so walk
+    // until the page falls out of the window.
+    for (let page = 1; page <= MAX_SHIPPING_PAGES; page++) {
+      let deployments: any[];
+      try {
+        deployments = await gh([
+          "api", "-X", "GET", `repos/${repository}/deployments`,
+          "-f", `per_page=${PER_PAGE}`, "-f", `page=${page}`,
+        ]);
+      } catch {
+        break;
+      }
+      let reachedWindowEdge = false;
+      for (const deployment of deployments) {
+        if (!deployment.created_at || new Date(deployment.created_at) < since) {
+          reachedWindowEdge = true;
+          continue;
+        }
+        const login = deployment.creator?.login?.toLowerCase();
+        const personId = login && people.byGithub.get(login);
+        if (!personId) continue;
+        out.push({
+          id: `github:deployed:${deployment.id}`,
+          source: "github",
+          type: "deployed",
+          personId,
+          ts: deployment.created_at,
+          url: deployment.url,
+          title: `deployed ${repository} to ${deployment.environment ?? "an environment"}`,
+          meta: { repo: repository, environment: deployment.environment ?? null },
+        });
+      }
+      if (reachedWindowEdge || deployments.length < PER_PAGE) break;
+    }
+
+    for (let page = 1; page <= MAX_SHIPPING_PAGES; page++) {
+      let runs: any;
+      try {
+        runs = await gh([
+          "api", "-X", "GET", `repos/${repository}/actions/runs`,
+          "-f", `created=>=${day}`, "-f", `per_page=${PER_PAGE}`, "-f", `page=${page}`,
+        ]);
+      } catch {
+        break;
+      }
+      const workflowRuns: any[] = runs.workflow_runs ?? [];
+      for (const run of workflowRuns) {
+        const startedByHand = run.event === "workflow_dispatch" || (run.run_attempt ?? 1) > 1;
+        if (!startedByHand) continue;
+        const login = run.actor?.login?.toLowerCase();
+        const personId = login && people.byGithub.get(login);
+        const ts = run.run_started_at ?? run.created_at;
+        if (!personId || !ts || new Date(ts) < since) continue;
+        out.push({
+          id: `github:ci_run:${run.id}:${run.run_attempt ?? 1}`,
+          source: "github",
+          type: "ci_run",
+          personId,
+          ts,
+          url: run.html_url,
+          title: `${run.name ?? "workflow"} on ${repository}`,
+          meta: {
+            repo: repository,
+            conclusion: run.conclusion ?? null,
+            attempt: run.run_attempt ?? 1,
+            event: run.event ?? null,
+          },
+        });
+      }
+      if (workflowRuns.length < PER_PAGE) break;
+    }
+  }
 
   return out;
 }

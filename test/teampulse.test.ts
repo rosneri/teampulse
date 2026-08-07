@@ -3,10 +3,14 @@ import { unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { indexPeople, loadConfig, parseSince } from "../src/config";
-import { markSynced, prisma, replaceOpenIssues, saveActivities } from "../src/db";
 import {
-  DEFAULT_BREAK_MINUTES, activityFeed, bugRatio, dailyCounts, daySessions, hourlyCounts,
+  findAiOutput, markSynced, prisma, recentAiOutputs, replaceAiUsage, replaceOpenIssues,
+  saveActivities, saveAiOutput,
+} from "../src/db";
+import {
+  DEFAULT_BREAK_MINUTES, activityFeed, aiUsage, aiUsageDaily, bugRatio, dailyCounts, coverage, daySessions, dayMarks, hourlyCounts,
   intakeMix, personStats, repositories, reviewWaits, shippedMix, staleIssues, teamStats,
+  lastSyncs, unclassifiedWork,
 } from "../src/metrics";
 import { arrivedViaPullRequest } from "../src/commitmessage";
 import {
@@ -14,16 +18,23 @@ import {
 } from "../src/ui/preferences";
 import { isWeekend } from "../src/workweek";
 import { classify } from "../src/worktype";
+import { collectVercel, scopeOf } from "../src/sources/vercel";
+import { KIND_OF, kindOf } from "../src/activitykind";
+import type { ActivityType } from "../src/types";
 
 const ago = (days: number) => new Date(Date.now() - days * 86_400_000).toISOString();
 const SINCE = new Date(Date.now() - 30 * 86_400_000);
 
 beforeEach(async () => {
   await prisma.activity.deleteMany({});
+  await prisma.aiUsage.deleteMany({});
+  await prisma.aiOutput.deleteMany({});
 });
 
 afterAll(async () => {
   await prisma.activity.deleteMany({});
+  await prisma.aiUsage.deleteMany({});
+  await prisma.aiOutput.deleteMany({});
   await prisma.$disconnect();
 });
 
@@ -159,7 +170,8 @@ test("indexPeople: every handle resolves to the canonical id", () => {
         name: "Maya",
         githubLogins: ["MayaGH", "maya-personal"],
         linear: "6b1f",
-        slack: "U01",
+        // Two Slack accounts, the way two GitHub logins work above.
+        slack: ["U01", "U07"],
         workWeek: "sunday-thursday",
       },
       { id: "sam", name: "Sam", githubLogins: [], workWeek: "monday-friday" },
@@ -174,9 +186,33 @@ test("indexPeople: every handle resolves to the canonical id", () => {
   expect(people.byGithub.get("maya-personal")).toBe("maya");
   expect(people.byLinear.get("6b1f")).toBe("maya");
   expect(people.bySlack.get("U01")).toBe("maya");
+  expect(people.bySlack.get("U07")).toBe("maya");
   // A person with no handles is still addressable by canonical id.
   expect(people.byId.get("sam")?.workWeek).toBe("monday-friday");
   expect(people.byGithub.size).toBe(2);
+});
+
+test("indexPeople: vercel takes one handle or several, alongside the email fallback", () => {
+  const people = indexPeople({
+    people: [
+      { id: "maya", name: "Maya", githubLogins: [], vercel: "Maya-V", workWeek: "sunday-thursday" },
+      {
+        id: "doron",
+        name: "Doron",
+        githubLogins: [],
+        // Two seats, neither on the work address the calendar uses.
+        vercel: ["doron-a", "doron-b"],
+        email: "Doron@acme.com",
+        workWeek: "sunday-thursday",
+      },
+    ],
+  });
+
+  expect(people.byVercel.get("maya-v")).toBe("maya");
+  expect(people.byVercel.get("doron-a")).toBe("doron");
+  expect(people.byVercel.get("doron-b")).toBe("doron");
+  // The email's local part still resolves, so an unlisted seat is not lost.
+  expect(people.byVercel.get("doron")).toBe("doron");
 });
 
 test("loadConfig: github accepts one login or several, and rejects junk", async () => {
@@ -235,6 +271,54 @@ test("teamStats and dailyCounts: totals, and one row per person per day", async 
   );
   expect(mayaOnDayThree?.n).toBe(2);
   expect(days.reduce((total, row) => total + row.n, 0)).toBe(7);
+});
+
+test("unclassifiedWork: the null tail the AI layer is asked about, and nothing else", async () => {
+  await saveActivities([
+    { id: "u1", source: "github", type: "pr_merged", personId: "maya", ts: ago(2), title: "Rework the exporter" },
+    { id: "u2", source: "linear", type: "issue_created", personId: "sam", ts: ago(2), title: "Exports look wrong" },
+    // Already classified: the deterministic layer answered, so nobody asks a model.
+    { id: "u3", source: "github", type: "pr_merged", personId: "maya", ts: ago(2), workType: "bug" },
+    // Unclassified but not a delivery — no mix counts it, so no work type would move a number.
+    { id: "u4", source: "slack", type: "message", personId: "maya", ts: ago(2), title: "morning" },
+  ]);
+
+  const items = await unclassifiedWork(SINCE);
+  expect(items.map((item) => item.id).toSorted()).toEqual(["u1", "u2"]);
+  expect(items.find((item) => item.id === "u1")?.title).toBe("Rework the exporter");
+});
+
+test("ai_output: judgment is found again by the hash of what it was shown", async () => {
+  const window = { windowStart: SINCE, windowEnd: new Date() };
+  await saveAiOutput({
+    kind: "work_type",
+    personId: "maya",
+    ...window,
+    inputDigest: "digest-one",
+    payload: { proposals: [{ activityId: "u1", workType: "improvement" }] },
+  });
+
+  const found = await findAiOutput("work_type", "maya", "digest-one");
+  expect(found?.payload).toEqual({ proposals: [{ activityId: "u1", workType: "improvement" }] });
+
+  // A different input is a different question: the stored answer must not be reused for it.
+  expect(await findAiOutput("work_type", "maya", "digest-two")).toBeNull();
+  // Nor may one kind of judgment answer for another.
+  expect(await findAiOutput("summary", "maya", "digest-one")).toBeNull();
+
+  // A second run over the same person is a second row: judgment is appended,
+  // never updated, so the reading it replaced stays readable.
+  await saveAiOutput({
+    kind: "work_type",
+    personId: "maya",
+    ...window,
+    inputDigest: "digest-two",
+    payload: { proposals: [] },
+  });
+
+  const recent = await recentAiOutputs();
+  expect(recent).toHaveLength(2);
+  expect(recent[0]?.inputDigest).toBe("digest-two");
 });
 
 test("teamStats: an empty window reports zeros, not nulls", async () => {
@@ -561,4 +645,210 @@ test("daySessions: a long enough silence splits the day, midnight always does", 
 
   // Repository scope reaches here too, and events with no repository survive it.
   expect(await daySessions(since, "UTC", "acme/web")).toEqual(sessions);
+});
+
+test("KIND_OF covers every activity type exactly once", () => {
+  // The taxonomy is what the day-shape colours mean. A type nobody classified
+  // would silently vanish from the chart rather than draw in the wrong colour.
+  const types: ActivityType[] = [
+    "pr_opened", "pr_merged", "pr_reviewed", "pr_commented", "commit_pushed",
+    "deployed", "ci_run", "issue_created", "issue_completed", "issue_commented",
+    "message", "thread_reply", "mention_received", "directive_received",
+    "doc_created", "doc_edited", "meeting",
+  ];
+  for (const type of types) expect(kindOf(type)).not.toBeNull();
+  expect(Object.keys(KIND_OF).toSorted()).toEqual(types.toSorted());
+  expect(kindOf("something_new")).toBeNull();
+});
+
+test("daySessions: a meeting occupies its real length, and swallows events inside it", async () => {
+  await saveActivities([
+    // A 90-minute meeting, and a commit pushed in the middle of it.
+    { id: "m1", source: "calendar", type: "meeting", personId: "maya",
+      ts: "2026-07-15T09:00:00.000Z", endsAt: "2026-07-15T10:30:00.000Z" },
+    { id: "m2", source: "github", type: "commit_pushed", personId: "maya",
+      ts: "2026-07-15T09:40:00.000Z" },
+    // Well after the meeting ends: a separate block.
+    { id: "m3", source: "github", type: "commit_pushed", personId: "maya",
+      ts: "2026-07-15T12:00:00.000Z" },
+  ]);
+  const since = new Date("2026-07-01T00:00:00.000Z");
+
+  expect(await daySessions(since, "UTC")).toEqual([
+    // 09:00 → 10:30, not 09:00 → 09:40: the meeting's own end is what closed it.
+    { person_id: "maya", day: "2026-07-15", started_minute: 540, ended_minute: 630, events: 2 },
+    { person_id: "maya", day: "2026-07-15", started_minute: 720, ended_minute: 720, events: 1 },
+  ]);
+});
+
+test("dayMarks: instants and meetings, grouped per minute and kind", async () => {
+  await saveActivities([
+    { id: "k1", source: "calendar", type: "meeting", personId: "maya",
+      ts: "2026-07-15T09:00:00.000Z", endsAt: "2026-07-15T10:00:00.000Z" },
+    { id: "k2", source: "github", type: "commit_pushed", personId: "maya",
+      ts: "2026-07-15T11:05:00.000Z" },
+    { id: "k3", source: "github", type: "pr_merged", personId: "maya",
+      ts: "2026-07-15T11:05:30.000Z", meta: { repo: "acme/web", number: 9 } },
+    { id: "k4", source: "slack", type: "message", personId: "maya",
+      ts: "2026-07-15T11:05:45.000Z" },
+  ]);
+  const since = new Date("2026-07-01T00:00:00.000Z");
+
+  const marks = await dayMarks(since, "UTC");
+  expect(marks).toEqual([
+    { person_id: "maya", day: "2026-07-15", type: "meeting",
+      started_minute: 540, ended_minute: 600, n: 1 },
+    // Two different types in the same minute stay two marks; two events of the
+    // same type in one minute collapse into one carrying a count.
+    { person_id: "maya", day: "2026-07-15", type: "commit_pushed",
+      started_minute: 665, ended_minute: 665, n: 1 },
+    { person_id: "maya", day: "2026-07-15", type: "message",
+      started_minute: 665, ended_minute: 665, n: 1 },
+    { person_id: "maya", day: "2026-07-15", type: "pr_merged",
+      started_minute: 665, ended_minute: 665, n: 1 },
+  ].toSorted((a, b) => a.started_minute - b.started_minute || a.type.localeCompare(b.type)));
+});
+
+test("coverage: counts per person per source, and says when each source last ran", async () => {
+  await saveActivities([
+    { id: "c1", source: "github", type: "commit_pushed", personId: "maya", ts: ago(1) },
+    { id: "c2", source: "github", type: "commit_pushed", personId: "maya", ts: ago(2) },
+    { id: "c3", source: "slack", type: "message", personId: "sam", ts: ago(1) },
+  ]);
+  await markSynced("notion");
+
+  const rows = await coverage(SINCE);
+  expect(rows.map((row) => [row.person_id, row.source, row.events])).toEqual([
+    ["maya", "github", 2],
+    ["sam", "slack", 1],
+  ]);
+  // A source that ran and found nothing still reports a run — silence and
+  // never-ran are different problems.
+  expect((await lastSyncs()).map((row) => row.source)).toContain("notion");
+});
+
+test("aiUsage: daily Claude Code rows are upserted, then summed per person", async () => {
+  const day = new Date().toISOString().slice(0, 10);
+  const row = {
+    personId: "maya", day, model: "claude-opus-5",
+    sessions: 3, inputTokens: 100, outputTokens: 20,
+    cacheReadTokens: 50, cacheCreationTokens: 10,
+    costAmount: 186, currency: "USD",
+    linesAdded: 40, linesRemoved: 5, commits: 2, pullRequests: 1,
+    toolsAccepted: 9, toolsRejected: 1,
+  };
+  await replaceAiUsage([row]);
+  // A day's totals grow until the day is over, so the same key must overwrite
+  // rather than accumulate — the second write is the whole day, not a delta.
+  await replaceAiUsage([{ ...row, sessions: 4, outputTokens: 25 }]);
+
+  const [summary] = await aiUsage(SINCE);
+  expect(summary).toMatchObject({
+    person_id: "maya", sessions: 4, input_tokens: 100, output_tokens: 25,
+    cost_amount: 186, currency: "USD", commits: 2, tools_accepted: 9, days_used: 1,
+  });
+
+  expect(await aiUsageDaily(SINCE)).toEqual([
+    { person_id: "maya", day, tokens: 185, cost_amount: 186 },
+  ]);
+});
+
+test("vercel scope: a slug and a real team id go in different parameters", () => {
+  // `vercel teams ls` prints slugs under a column headed "id", so both shapes
+  // reach .env — and sending a slug as teamId fails as "team not found".
+  const slug = scopeOf("acme-team", new URL("https://api.vercel.com/v6/deployments"));
+  expect(slug.searchParams.get("slug")).toBe("acme-team");
+  expect(slug.searchParams.get("teamId")).toBeNull();
+
+  const id = scopeOf("team_abc123", new URL("https://api.vercel.com/v6/deployments"));
+  expect(id.searchParams.get("teamId")).toBe("team_abc123");
+
+  // A personal account has no scope at all.
+  expect([...scopeOf(undefined, new URL("https://api.vercel.com/v6/deployments")).searchParams]).toEqual([]);
+});
+
+test("collectVercel: pages through deployments, credits by username then email", async () => {
+  const people = indexPeople({
+    people: [
+      { id: "maya", name: "Maya", githubLogins: [], vercel: "maya-v", workWeek: "sunday-thursday" },
+      { id: "sam", name: "Sam", githubLogins: [], email: "Sam@acme.com", workWeek: "monday-friday" },
+    ],
+  });
+
+  const pages = [
+    {
+      deployments: [
+        { uid: "d1", name: "web", url: "web.vercel.app", created: 1_760_000_000_000,
+          target: "production", state: "READY", creator: { username: "maya-v" } },
+        // No handle anywhere in people.yaml: a build by a bot or a stranger.
+        { uid: "d2", name: "web", created: 1_760_000_100_000, creator: { username: "ci-bot" } },
+      ],
+      pagination: { next: 1_759_000_000_000 },
+    },
+    {
+      deployments: [
+        // Only an email: the local part is the fallback handle, case-insensitively.
+        { uid: "d3", name: "api", created: 1_759_500_000_000, creator: { email: "Sam@acme.com" } },
+      ],
+      pagination: { next: null },
+    },
+  ];
+
+  const requested: string[] = [];
+  const realFetch = globalThis.fetch;
+  // Bun's fetch carries a `preconnect` property the stubs do not; the cast is
+  // over a value only this test ever calls, and it is restored in `finally`.
+  const stub = (handler: (input: string | URL) => Promise<Response>) =>
+    Object.assign(handler, { preconnect: realFetch.preconnect }) as typeof fetch;
+  process.env.VERCEL_TOKEN = "test-token";
+  process.env.VERCEL_TEAM_ID = "acme-team";
+  globalThis.fetch = stub(async (input) => {
+    requested.push(String(input));
+    return new Response(JSON.stringify(pages.shift() ?? { deployments: [] }), { status: 200 });
+  });
+
+  try {
+    const rows = await collectVercel(people, new Date("2026-07-01T00:00:00.000Z"));
+    expect(rows.map((row) => [row.id, row.personId, row.type])).toEqual([
+      ["vercel:deployed:d1", "maya", "deployed"],
+      ["vercel:deployed:d3", "sam", "deployed"],
+    ]);
+    expect(rows[0]?.title).toBe("deployed web to production");
+    expect(rows[0]?.url).toBe("https://web.vercel.app");
+    // The second request walks backwards from the first page's cursor.
+    expect(requested[0]).toContain("slug=acme-team");
+    expect(requested[1]).toContain("until=1759000000000");
+
+    // A failed call is loud rather than an empty sync that reads as a quiet week.
+    globalThis.fetch = stub(async () =>
+      new Response(JSON.stringify({ error: { message: "not authorized" } }), { status: 403 }));
+    expect(collectVercel(people, new Date())).rejects.toThrow(/not authorized/);
+
+    // Deployments exist but nobody matches: the sync line would read "0 events",
+    // so the collector has to name the handles instead of shrugging.
+    const warnings: string[] = [];
+    const realWarn = console.warn;
+    console.warn = (message: string) => warnings.push(message);
+    globalThis.fetch = stub(async () =>
+      new Response(
+        JSON.stringify({
+          deployments: [
+            { uid: "d9", name: "web", created: 1_760_000_000_000, creator: { username: "ci-bot" } },
+          ],
+          pagination: { next: null },
+        }),
+        { status: 200 },
+      ));
+    try {
+      expect(await collectVercel(people, new Date("2026-07-01T00:00:00.000Z"))).toEqual([]);
+      expect(warnings.join(" ")).toContain("ci-bot");
+    } finally {
+      console.warn = realWarn;
+    }
+
+    process.env.VERCEL_TOKEN = "";
+    expect(collectVercel(people, new Date())).rejects.toThrow(/VERCEL_TOKEN not set/);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
 });

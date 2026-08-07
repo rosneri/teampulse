@@ -1,4 +1,5 @@
 import { Bar, BarChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
+import { ACTIVITY_KINDS, type ActivityKind, KIND_LABELS } from "../activitykind";
 import {
   formatDayLabel, formatDayTick, formatDuration, formatHourOfDay, formatMinuteOfDay,
   formatNumber, formatPercent,
@@ -340,26 +341,66 @@ export function HoursHeatmap({ rows }: { rows: HoursRow[] }) {
   );
 }
 
-/** One person's calendar day: the stretches they were working, in order. */
+/** One person's calendar day: the stretches they were working, and what the work was. */
 export type DaySpan = {
   date: string;
   sessions: { startMinute: number; endMinute: number; events: number }[];
+  marks: { startMinute: number; endMinute: number; kind: ActivityKind; count: number }[];
 };
 
 const MINUTES_IN_DAY = HOURS_IN_DAY * 60;
 
-/** A session of a single event has no width of its own; it still has to be visible. */
-const MINIMUM_BLOCK_WIDTH = "3px";
+/** A mark for a single instant has no width of its own; it still has to be visible. */
+const MINIMUM_MARK_WIDTH = "3px";
 
 /**
- * One row per day, each session drawn where it actually happened against a 24-hour
- * track. What the eye is meant to catch is the *gaps* — the track showing through
- * between two blocks is a break, and its length is read off the axis.
- *
- * Blocks are the visible edge of the work, not the work: an hour spent reading
- * code emits no events and is indistinguishable from lunch. The card says so.
+ * A colour per kind of work, assigned in the fixed order the kinds are declared
+ * in — so "meeting" is the same violet whether or not anybody coded that week.
+ * The palette's slots are validated in this order; keeping the order keeps the
+ * separation between neighbouring kinds.
  */
-export function DayShape({ days, breakMinutes }: { days: DaySpan[]; breakMinutes: number }) {
+export const KIND_COLORS: Record<ActivityKind, string> = Object.fromEntries(
+  ACTIVITY_KINDS.map((kind, index) => [kind, `var(--series-${index + 1})`]),
+) as Record<ActivityKind, string>;
+
+const percent = (minutes: number) => (minutes / MINUTES_IN_DAY) * 100;
+
+function KindLegend({ kinds }: { kinds: ActivityKind[] }) {
+  if (!kinds.length) return null;
+  return (
+    <div className="mt-4 flex flex-wrap gap-x-4 gap-y-1">
+      {kinds.map((kind) => (
+        <span key={kind} className="flex items-center gap-1.5 text-xs text-ink-secondary">
+          <span
+            aria-hidden="true"
+            className="inline-block h-2 w-2 rounded-full"
+            style={{ background: KIND_COLORS[kind] }}
+          />
+          {KIND_LABELS[kind]}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+/**
+ * One row per day, drawn twice over: the pale band is the stretch the person was
+ * going, and the coloured marks on top are what they were actually doing at that
+ * minute. The gaps between bands are the breaks; a wide violet block is a
+ * meeting, which is the one kind of work that owns real time rather than a moment.
+ *
+ * Marks are the visible edge of the work, not the work: a commit is an instant,
+ * so an hour spent reading code shows as an empty stretch inside a band.
+ */
+export function DayShape({
+  days,
+  breakMinutes,
+  kinds,
+}: {
+  days: DaySpan[];
+  breakMinutes: number;
+  kinds: ActivityKind[];
+}) {
   if (!days.length) {
     return <p className="py-12 text-center text-sm text-ink-muted">No activity in this window.</p>;
   }
@@ -377,20 +418,42 @@ export function DayShape({ days, breakMinutes }: { days: DaySpan[]; breakMinutes
                 {formatDayLabel(day.date)}
               </div>
 
-              <div className="relative h-5 flex-1 overflow-hidden rounded-[2px]" style={{ background: "var(--gridline)" }}>
+              <div
+                className="relative h-5 flex-1 overflow-hidden rounded-[2px]"
+                style={{ background: "var(--gridline)" }}
+              >
                 {day.sessions.map((session) => (
                   <div
-                    key={session.startMinute}
-                    className="absolute inset-y-0 rounded-[2px]"
+                    key={`band-${session.startMinute}`}
+                    className="absolute inset-y-0"
                     style={{
-                      background: "var(--series-1)",
-                      left: `${(session.startMinute / MINUTES_IN_DAY) * 100}%`,
-                      width: `max(${MINIMUM_BLOCK_WIDTH}, ${((session.endMinute - session.startMinute) / MINUTES_IN_DAY) * 100}%)`,
+                      background: "var(--axis)",
+                      left: `${percent(session.startMinute)}%`,
+                      width: `max(${MINIMUM_MARK_WIDTH}, ${percent(session.endMinute - session.startMinute)}%)`,
                     }}
                     title={
                       `${formatMinuteOfDay(session.startMinute)} → ${formatMinuteOfDay(session.endMinute)} · ` +
                       `${formatDuration(session.endMinute - session.startMinute)} · ` +
                       `${formatNumber(session.events)} events`
+                    }
+                  />
+                ))}
+
+                {day.marks.map((mark) => (
+                  <div
+                    key={`${mark.kind}-${mark.startMinute}`}
+                    className="absolute inset-y-0 rounded-[1px]"
+                    style={{
+                      background: KIND_COLORS[mark.kind],
+                      left: `${percent(mark.startMinute)}%`,
+                      width: `max(${MINIMUM_MARK_WIDTH}, ${percent(mark.endMinute - mark.startMinute)}%)`,
+                    }}
+                    title={
+                      `${KIND_LABELS[mark.kind]} · ${formatMinuteOfDay(mark.startMinute)}` +
+                      (mark.endMinute > mark.startMinute
+                        ? ` → ${formatMinuteOfDay(mark.endMinute)} (${formatDuration(mark.endMinute - mark.startMinute)})`
+                        : "") +
+                      ` · ${formatNumber(mark.count)} events`
                     }
                   />
                 ))}
@@ -431,7 +494,9 @@ export function DayShape({ days, breakMinutes }: { days: DaySpan[]; breakMinutes
           <div className="w-44 shrink-0" />
         </div>
 
-        <p className="mt-4 text-xs text-ink-muted">
+        <KindLegend kinds={kinds} />
+
+        <p className="mt-3 text-xs text-ink-muted">
           A gap of more than {formatDuration(breakMinutes)} between events starts a new block.
         </p>
       </div>

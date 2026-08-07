@@ -258,6 +258,16 @@ export const DEFAULT_BREAK_MINUTES = 60;
  * calendar day is the unit being asked about, so a night that runs past it is
  * two short days rather than one long session.
  */
+/**
+ * Every activity as a span in the reader's day: the instant ones start and end at
+ * the same minute, and a meeting occupies the real length it ran for. This is the
+ * one query that reads `meta.endsAt`, and the reason it exists — a two-hour
+ * meeting is two hours of a person's day, not a dot at the hour it started.
+ *
+ * A span that runs past local midnight is clamped to the end of its own day: the
+ * day-shape chart is a 24-hour track, and an evening call that finishes at 00:30
+ * belongs to the evening it started in.
+ */
 export function daySessions(
   since: Date,
   timezone: string,
@@ -266,33 +276,87 @@ export function daySessions(
 ) {
   return prisma.$queryRaw<DaySession[]>`
     with local as (
-      select person_id, ts at time zone ${timezone} as local_ts
+      select person_id,
+        ts at time zone ${timezone} as started,
+        least(
+          coalesce((meta ->> 'endsAt')::timestamptz, ts) at time zone ${timezone},
+          date_trunc('day', ts at time zone ${timezone}) + interval '1 day' - interval '1 minute'
+        ) as ended,
+        (ts at time zone ${timezone})::date as day
       from activity
       where ts >= ${since} ${inRepository(repository)}
     ),
     bounded as (
-      select person_id, local_ts, local_ts::date as day,
-        case
-          when local_ts - lag(local_ts) over (
-                 partition by person_id, local_ts::date order by local_ts
-               ) > make_interval(mins => ${breakMinutes}::int)
-          then 1 else 0
-        end as opens_session
+      select person_id, day, started, ended,
+        -- The furthest anything has run to so far today. A new block opens only
+        -- when the silence since *everything* before it is long enough, so an
+        -- event inside a meeting never splits the meeting in two.
+        max(ended) over (
+          partition by person_id, day order by started
+          rows between unbounded preceding and 1 preceding
+        ) as prior_end
       from local
     ),
     sessioned as (
-      select person_id, day, local_ts,
-        sum(opens_session) over (partition by person_id, day order by local_ts) as session
+      select person_id, day, started, ended,
+        sum(
+          case
+            when prior_end is null then 0
+            when started - prior_end > make_interval(mins => ${breakMinutes}::int) then 1
+            else 0
+          end
+        ) over (partition by person_id, day order by started) as session
       from bounded
     )
     select person_id,
       to_char(sessioned.day, 'YYYY-MM-DD') as day,
-      (extract(hour from min(local_ts)) * 60 + extract(minute from min(local_ts)))::int as started_minute,
-      (extract(hour from max(local_ts)) * 60 + extract(minute from max(local_ts)))::int as ended_minute,
+      (extract(hour from min(started)) * 60 + extract(minute from min(started)))::int as started_minute,
+      (extract(hour from max(ended)) * 60 + extract(minute from max(ended)))::int as ended_minute,
       count(*)::int as events
     from sessioned
     group by person_id, sessioned.day, session
     order by person_id, day, started_minute`;
+}
+
+/**
+ * One mark per kind of work per minute — what the coloured blocks in the day
+ * shape are drawn from. Grouped by minute rather than returned per row so a
+ * burst of twenty commits in one minute is one mark carrying a count, not twenty
+ * overlapping rectangles.
+ *
+ * The event `type` is returned raw: which kinds exist and what colour they wear
+ * is the presentation layer's business, and it already owns that table.
+ */
+export type DayMark = {
+  person_id: string;
+  day: string;
+  type: string;
+  started_minute: number;
+  ended_minute: number;
+  n: number;
+};
+
+export function dayMarks(since: Date, timezone: string, repository?: string) {
+  return prisma.$queryRaw<DayMark[]>`
+    with local as (
+      select person_id, type,
+        ts at time zone ${timezone} as started,
+        least(
+          coalesce((meta ->> 'endsAt')::timestamptz, ts) at time zone ${timezone},
+          date_trunc('day', ts at time zone ${timezone}) + interval '1 day' - interval '1 minute'
+        ) as ended
+      from activity
+      where ts >= ${since} ${inRepository(repository)}
+    )
+    select person_id,
+      to_char(started::date, 'YYYY-MM-DD') as day,
+      type,
+      (extract(hour from started) * 60 + extract(minute from started))::int as started_minute,
+      (extract(hour from ended) * 60 + extract(minute from ended))::int as ended_minute,
+      count(*)::int as n
+    from local
+    group by 1, 2, 3, 4, 5
+    order by 1, 2, 4`;
 }
 
 export type FeedRow = {
@@ -330,6 +394,118 @@ export function activityFeed(options: {
     where ts >= ${options.since} ${person} ${inRepository(options.repository)}
     order by ts desc
     limit ${limit}`;
+}
+
+export type UnclassifiedItem = {
+  id: string;
+  person_id: string;
+  type: string;
+  ts: Date;
+  title: string | null;
+  body: string | null;
+};
+
+/**
+ * The null tail: merged pull requests and created issues whose kind of work
+ * neither a label nor a title prefix stated, and which every mix therefore
+ * reports as unclassified. Restricted to those two event types because they are
+ * the only ones a work type moves a ratio for.
+ */
+export function unclassifiedWork(since: Date, repository?: string) {
+  return prisma.$queryRaw<UnclassifiedItem[]>`
+    select id, person_id, type, ts, title, body
+    from activity
+    where work_type is null
+      and type in ('pr_merged', 'issue_created')
+      and ts >= ${since} ${inRepository(repository)}
+    order by ts desc`;
+}
+
+/**
+ * How much each source actually produced, per person, in the window.
+ *
+ * This is the answer to "are we really seeing everything they do": a person with
+ * a Slack handle and zero Slack rows is either quiet or invisible, and those two
+ * look identical in every other chart on the page. It cannot prove coverage —
+ * nothing can, from inside — but it makes silence visible instead of letting it
+ * pass for calm.
+ */
+export type SourceCoverage = { person_id: string; source: string; events: number; last_seen: Date | null };
+
+export function coverage(since: Date) {
+  return prisma.$queryRaw<SourceCoverage[]>`
+    select person_id, source, count(*)::int as events, max(ts) as last_seen
+    from activity
+    where ts >= ${since}
+    group by 1, 2
+    order by 1, 2`;
+}
+
+/** When each source last ran, whatever it found. A stale source is its own kind of gap. */
+export function lastSyncs() {
+  return prisma.$queryRaw<{ source: string; last_run: Date }[]>`
+    select source, last_run from sync_run order by source`;
+}
+
+/**
+ * Claude Code usage per person over the window. Daily by nature — the analytics
+ * API reports whole days — so this is a total, never a time of day.
+ */
+export type AiUsage = {
+  person_id: string;
+  sessions: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cache_creation_tokens: number;
+  /** Minor units, as the API reports it: cents for USD. */
+  cost_amount: number;
+  currency: string;
+  lines_added: number;
+  lines_removed: number;
+  commits: number;
+  pull_requests: number;
+  tools_accepted: number;
+  tools_rejected: number;
+  days_used: number;
+};
+
+export function aiUsage(since: Date) {
+  return prisma.$queryRaw<AiUsage[]>`
+    select person_id,
+      sum(sessions)::int                as sessions,
+      sum(input_tokens)::int            as input_tokens,
+      sum(output_tokens)::int           as output_tokens,
+      sum(cache_read_tokens)::int       as cache_read_tokens,
+      sum(cache_creation_tokens)::int   as cache_creation_tokens,
+      sum(cost_amount)::int             as cost_amount,
+      min(currency)                     as currency,
+      sum(lines_added)::int             as lines_added,
+      sum(lines_removed)::int           as lines_removed,
+      sum(commits)::int                 as commits,
+      sum(pull_requests)::int           as pull_requests,
+      sum(tools_accepted)::int          as tools_accepted,
+      sum(tools_rejected)::int          as tools_rejected,
+      count(distinct day)::int          as days_used
+    from ai_usage
+    where day >= ${since}
+    group by person_id
+    order by person_id`;
+}
+
+/** One row per person per day — the Claude Code strip. */
+export type AiUsageDay = { person_id: string; day: string; tokens: number; cost_amount: number };
+
+export function aiUsageDaily(since: Date) {
+  return prisma.$queryRaw<AiUsageDay[]>`
+    select person_id,
+      to_char(day, 'YYYY-MM-DD') as day,
+      sum(input_tokens + output_tokens + cache_read_tokens + cache_creation_tokens)::int as tokens,
+      sum(cost_amount)::int as cost_amount
+    from ai_usage
+    where day >= ${since}
+    group by 1, 2
+    order by 1, 2`;
 }
 
 /** Open assignments nobody has touched in a while. */

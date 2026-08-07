@@ -70,3 +70,35 @@ model SyncRun {
 
   @@map("sync_run")
 }
+
+/// What Claude Code cost and produced, per person per day.
+/// Not activity: the analytics API buckets by calendar day, so these rows carry
+/// no time of day and must never reach the hour-of-day or day-shape charts —
+/// midnight is not when the work happened, it is only where the bucket starts.
+/// Replaced per (person, day, model) on each sync, because a day's totals grow
+/// until the day is over.
+model AiUsage {
+  personId    String   @map("person_id")
+  /// Calendar day in UTC, as the analytics API reports it.
+  day         DateTime @db.Date
+  model       String
+  sessions    Int      @default(0)
+  inputTokens Int      @map("input_tokens") @default(0)
+  outputTokens Int     @map("output_tokens") @default(0)
+  cacheReadTokens Int  @map("cache_read_tokens") @default(0)
+  cacheCreationTokens Int @map("cache_creation_tokens") @default(0)
+  /// Minor units of `currency` — cents for USD, as the API reports it.
+  costAmount  Int      @map("cost_amount") @default(0)
+  currency    String   @default("USD")
+  linesAdded  Int      @map("lines_added") @default(0)
+  linesRemoved Int     @map("lines_removed") @default(0)
+  commits     Int      @default(0)
+  pullRequests Int     @map("pull_requests") @default(0)
+  toolsAccepted Int    @map("tools_accepted") @default(0)
+  toolsRejected Int    @map("tools_rejected") @default(0)
+  syncedAt    DateTime @default(now()) @map("synced_at") @db.Timestamptz(3)
+
+  @@id([personId, day, model])
+  @@index([day])
+  @@map("ai_usage")
+}

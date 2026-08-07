@@ -8,7 +8,9 @@ Two layers, kept strictly apart:
 - **Facts** — every number comes from SQL over `activity`. Deterministic, free,
   reproducible. No model is involved.
 - **Judgment** — the AI layer writes only to `ai_output`, stamped with a hash of
-  exactly what it was shown. It never touches `activity`.
+  exactly what it was shown. It never touches `activity`. It runs on the
+  Anthropic API through the Vercel AI SDK, against a Zod schema that describes
+  each field it is allowed to fill in — see `src/judgment.ts`.
 
 ## Setup
 
@@ -106,11 +108,34 @@ Everything happens there:
   per hour of the day. Hours are read in the browser's own timezone, and each
   row is shaded against that person's own busiest hour — the grid answers *when*
   somebody works, not how much. Hide weekends applies here too.
+- **Day shape** takes one person at a time and draws every working day: the
+  blocks are when they were actually going, the gaps between them are the
+  breaks, and the coloured marks say what the work was — code, review, chat,
+  issues, docs, ship, meetings, and the table view spells out each block's start and end. A silence
+  longer than an hour starts a new block — `DEFAULT_BREAK_MINUTES` in
+  `src/metrics.ts` is the knob. Events are instants, so a block is the visible
+  edge of the work: an hour spent reading code emits nothing and reads as lunch.
+- **Claude Code** shows tokens, cost, sessions and accepted edits per person from
+  Anthropic's usage report. It is reported by whole day, so it carries no time of
+  day and deliberately never reaches the two charts above.
+- **Judgment** is the one card on the page no number comes from. **Run judgment**
+  asks a model two questions about each person — what their window was about, and
+  what kind of work the unclassified merged PRs and created issues were — and
+  appends the answers to `ai_output`. It never writes `activity.work_type`, so a
+  proposal stays a proposal and every mix keeps reporting its visible gap. Each
+  call is keyed by a hash of the exact prompt, so asking twice about the same
+  events answers from the first run instead of paying again, and one person
+  failing is reported in their own entry rather than costing you the others. It
+  is the only button here that spends money, which is why nothing but a click
+  runs it — `POST /api/judge?since=30d` is the same action from a terminal.
+- **Coverage** shows how many events each source produced per person. A source
+  that is configured and reports zero is either a quiet week or a blind spot —
+  everywhere else on the page those look identical.
 - **Selecting a person** opens their stats and their last 40 events.
 
 `PORT` overrides the port. The server binds localhost and has no authentication;
-`POST /api/sync` changes state, so it needs an auth layer before it is ever
-exposed beyond the machine it runs on.
+`POST /api/sync` and `POST /api/judge` change state, so they need an auth layer
+before either is ever exposed beyond the machine it runs on.
 
 There is no command line interface. `src/server.ts` is the entry point.
 
@@ -181,12 +206,51 @@ where source = 'github' and meta ->> 'repo' not like 'YourOrg/%';
 - **No sentiment analysis on Slack.**
 - **No webhooks.** A poll is enough and needs no infrastructure.
 
+## What this does and does not see
+
+Every number here is a floor, not a census. The collectors are honest about
+where they stop, and the **Coverage** card exists so a blind spot looks
+different from a quiet week. The known limits, per source:
+
+- **GitHub** — pull requests, issues, review submissions, review-thread and
+  conversation comments, commits on the default branch, deployments, and
+  workflow runs a person started by hand. Not counted: commits on branches that
+  never merged, and anything GitHub's search truncates (it caps at 1000 results
+  per query, so a very wide window silently loses the tail). A commit whose
+  author GitHub cannot resolve to a login belongs to nobody.
+- **Linear** — issues created and completed, and comments. State changes,
+  assignment changes, estimates and project updates are not events here.
+- **Slack** — the hard ceiling: a user token only reaches conversations *you*
+  are in. Anything a teammate says in a channel you never joined, or in a DM
+  with someone else, is invisible and always will be. Reactions, file uploads
+  and huddles are not counted either.
+- **Notion** — pages carry `created_by` and `last_edited_by` and nothing
+  between. Ten edits collapse into one row, and an earlier editor who was later
+  overwritten leaves no trace. Comments have no workspace-wide API and are not
+  collected.
+- **Calendar** — meetings the person did not decline, excluding all-day entries
+  and anything they marked as free. This is the only source with a real
+  duration, which is why it is also the only one that can say a person was
+  occupied rather than that they surfaced.
+- **Claude Code** — daily totals only, and only for actors on API billing:
+  anyone signed in to Claude Code through a claude.ai subscription does not
+  appear in the report at all.
+- **Everything else is an instant.** A commit is the moment work surfaced, not
+  the hour that produced it, so an hour of reading code is indistinguishable
+  from an hour of lunch. The day-shape card says so on its face.
+
+Two more general limits worth knowing: a person with no handle for a source is
+invisible in it — the Coverage card prints **not set up** rather than a zero —
+and nothing is backfilled automatically, so a window you have never synced is
+empty rather than wrong.
+
 ## Layout
 
 ```
 prisma/schema.prisma   activity, open_issue, ai_output, sync_run
 src/types.ts           the Activity shape every source collapses into
 src/worktype.ts        deterministic bug/feature/improvement/chore classifier
+src/judgment.ts        the AI layer: Zod schemas, prompts, writes to ai_output
 src/commitmessage.ts   whether a commit already arrived through a merged PR
 src/workweek.ts        which days a person works, and so which are their weekend
 src/config.ts          people.yaml: parsed, validated, indexed by handle
@@ -214,8 +278,12 @@ connection. `.mcp.json` registers it for MCP clients that read one:
 ```
 
 Tools: `people`, `team_stats`, `person_stats`, `review_waits`, `shipped_mix`,
-`intake_mix`, `bug_ratio`, `daily_counts`, `hourly_counts`, `stale_issues`,
-`activity`.
+`intake_mix`, `bug_ratio`, `daily_counts`, `hourly_counts`, `day_sessions`,
+`day_marks`, `coverage`, `ai_usage`, `judgments`, `stale_issues`, `activity`.
+
+`judgments` is the one tool whose answers are not facts: it reads back what the
+AI layer stored, and its own description says so, so a model reading it knows not
+to add a proposed work type to a count that deliberately excludes it.
 
 It is **read-only on purpose**. There is no sync tool: pulling from GitHub,
 Linear and Slack is a person's decision, and the UI is where it is made. Every
