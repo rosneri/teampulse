@@ -1,8 +1,9 @@
 import { indexPeople, loadConfig, parseSince } from "./config";
+import { judge, storedJudgments } from "./judgment";
 import {
-  DEFAULT_BREAK_MINUTES, activityFeed, bugRatio, dailyCounts, daySessions,
-  hourlyCounts, intakeMix, personStats, repositories, reviewWaits, shippedMix,
-  staleIssues, teamStats,
+  DEFAULT_BREAK_MINUTES, activityFeed, aiUsage, bugRatio, coverage, dailyCounts,
+  daySessions, dayMarks, hourlyCounts, intakeMix, lastSyncs, personStats,
+  repositories, reviewWaits, shippedMix, staleIssues, teamStats,
 } from "./metrics";
 import { SOURCES, type SyncResult, isSource, sync } from "./sync";
 import index from "./ui/index.html";
@@ -44,8 +45,10 @@ function timezoneOf(url: string): string | null {
   const parameter = new URL(url).searchParams.get("tz");
   if (!parameter) return "UTC";
   try {
-    new Intl.DateTimeFormat("en", { timeZone: parameter });
-    return parameter;
+    // Constructing it is the check: an unknown zone throws a RangeError here
+    // rather than a hundred lines later inside Postgres.
+    const format = new Intl.DateTimeFormat("en", { timeZone: parameter });
+    return format.resolvedOptions().timeZone ? parameter : null;
   } catch {
     return null;
   }
@@ -71,13 +74,19 @@ const server = Bun.serve({
 
       const repository = repositoryOf(req.url);
 
-      const [stats, waits, days, hours, sessions, team, ship, intake, bugs, stale, repos] =
-        await Promise.all([
+      const [
+        stats, waits, days, hours, sessions, marks, team, ship, intake, bugs,
+        stale, repos, sourceCoverage, syncs, ai, judgments,
+      ] = await Promise.all([
         personStats(since, repository), reviewWaits(since, repository),
         dailyCounts(since, repository), hourlyCounts(since, timezone, repository),
-        daySessions(since, timezone, repository), teamStats(since, repository),
+        daySessions(since, timezone, repository), dayMarks(since, timezone, repository),
+        teamStats(since, repository),
         shippedMix(since, repository), intakeMix(since, repository),
         bugRatio(since, repository), staleIssues(), repositories(since),
+        coverage(since), lastSyncs(), aiUsage(since),
+        // Read only: judgments are produced by POST /api/judge, never by loading a page.
+        storedJudgments(),
       ]);
 
       return Response.json({
@@ -89,9 +98,35 @@ const server = Bun.serve({
           id: person.id,
           name: person.name,
           workWeek: person.workWeek,
+          // Which sources this person *could* appear in. A handle nobody filled
+          // in is the difference between "quiet" and "not being looked at".
+          handles: {
+            github: person.githubLogins.length > 0,
+            linear: Boolean(person.linear),
+            slack: Boolean(person.slack),
+            notion: Boolean(person.notion),
+            calendar: Boolean(person.email),
+            vercel: Boolean(person.vercel || person.email),
+            // Claude Code is attributed by work email. Without one the report can
+            // never name this person, however much they use it.
+            anthropic: Boolean(person.email),
+          },
         })),
         breakMinutes: DEFAULT_BREAK_MINUTES,
-        team, stats, waits, days, hours, sessions, ship, intake, bugs, stale,
+        team, stats, waits, days, hours, sessions, marks, ship, intake, bugs, stale,
+        // Claude Code has its own table, so `coverage` — which reads `activity` —
+        // is blind to it. Days used is the same question that table asks of every
+        // other source: did we hear anything at all.
+        coverage: [
+          ...sourceCoverage,
+          ...ai.map((row) => ({
+            person_id: row.person_id,
+            source: "anthropic",
+            events: row.days_used,
+            last_seen: null,
+          })),
+        ],
+        syncs, ai, judgments,
       });
     },
 
@@ -119,13 +154,31 @@ const server = Bun.serve({
           requested.filter(isSource),
         );
         for (const result of results) {
-          console.log(
-            result.error
-              ? `${result.label}: FAILED — ${result.error}`
-              : `${result.label}: ${result.collected} events, ${result.saved} new`,
-          );
+          if (result.skipped) console.log(`${result.label}: skipped — ${result.skipped}`);
+          else if (result.error) console.log(`${result.label}: FAILED — ${result.error}`);
+          else console.log(`${result.label}: ${result.collected} events, ${result.saved} new`);
         }
         return Response.json({ results });
+      },
+    },
+
+    /**
+     * The judgment layer, run on demand for the current window. Like `/api/sync`
+     * this holds the request open and changes state — it appends to `ai_output`,
+     * never to `activity` — and it costs money per call, so nothing triggers it
+     * but a person asking.
+     */
+    "/api/judge": {
+      POST: async (req) => {
+        const since = windowOf(req.url);
+        if (!since) return bad("bad ?since — use 30d, 12w, 6m or a date");
+
+        const judgments = await judge({
+          personIds: configuration.people.map((person) => person.id),
+          since,
+          repository: repositoryOf(req.url),
+        });
+        return Response.json({ since: since.toISOString(), judgments });
       },
     },
 

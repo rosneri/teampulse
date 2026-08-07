@@ -1,4 +1,7 @@
-export type WorkType = "bug" | "feature" | "improvement" | "chore";
+/** The four kinds, in one place: the classifier, the AI schema and the charts all read this list. */
+export const WORK_TYPES = ["bug", "feature", "improvement", "chore"] as const;
+
+export type WorkType = (typeof WORK_TYPES)[number];
 
 /**
  * Deterministic classifier: explicit labels beat title conventions, and anything

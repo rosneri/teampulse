@@ -11,7 +11,20 @@ export type Person = {
    */
   githubLogins: string[];
   linear?: string;
-  slack?: string;
+  /** Slack user id, or a list when they post from more than one account. */
+  slack?: string | string[];
+  /** Notion user id. Notion attributes a page to a user id, never to an email. */
+  notion?: string;
+  /**
+   * Work email. The calendar is read by impersonating this address, and it is
+   * also what a Vercel deployment is matched on when no explicit handle is given.
+   */
+  email?: string;
+  /**
+   * Vercel username, when it differs from the local part of their email. A list
+   * when they deploy from more than one account, the way `github` allows.
+   */
+  vercel?: string | string[];
   /** Defaults to DEFAULT_WORK_WEEK when people.yaml leaves it out. */
   workWeek: WorkWeek;
 };
@@ -28,6 +41,10 @@ export type People = {
   byGithub: Map<string, string>;
   byLinear: Map<string, string>;
   bySlack: Map<string, string>;
+  byNotion: Map<string, string>;
+  /** Lower-cased: an address is the same address whatever case a vendor echoes back. */
+  byEmail: Map<string, string>;
+  byVercel: Map<string, string>;
 };
 
 /**
@@ -83,6 +100,9 @@ export async function loadConfig(path = "people.yaml"): Promise<Config> {
       name: rawPerson.name,
       linear: rawPerson.linear,
       slack: rawPerson.slack,
+      notion: rawPerson.notion,
+      email: rawPerson.email,
+      vercel: rawPerson.vercel,
       githubLogins: parseGithubLogins(rawPerson),
       workWeek: rawPerson.workWeek ?? DEFAULT_WORK_WEEK,
     };
@@ -98,6 +118,9 @@ export function indexPeople(configuration: Config): People {
     byGithub: new Map(),
     byLinear: new Map(),
     bySlack: new Map(),
+    byNotion: new Map(),
+    byEmail: new Map(),
+    byVercel: new Map(),
   };
   for (const person of configuration.people) {
     index.byId.set(person.id, person);
@@ -106,7 +129,13 @@ export function indexPeople(configuration: Config): People {
     // GitHub logins are case-insensitive; everything else is an opaque id.
     for (const login of person.githubLogins) index.byGithub.set(login.toLowerCase(), person.id);
     if (person.linear) index.byLinear.set(person.linear, person.id);
-    if (person.slack) index.bySlack.set(person.slack, person.id);
+    for (const id of [person.slack ?? []].flat()) index.bySlack.set(id, person.id);
+    if (person.notion) index.byNotion.set(person.notion, person.id);
+    if (person.email) index.byEmail.set(person.email.toLowerCase(), person.id);
+    // A Vercel deployment names its creator by username; the email is the fallback
+    // for the common case where nobody bothered to write the username down.
+    for (const handle of [person.vercel ?? []].flat()) index.byVercel.set(handle.toLowerCase(), person.id);
+    if (person.email) index.byVercel.set(person.email.split("@")[0]!.toLowerCase(), person.id);
   }
   return index;
 }
