@@ -1,7 +1,8 @@
 import { indexPeople, loadConfig, parseSince } from "./config";
 import {
-  activityFeed, bugRatio, dailyCounts, hourlyCounts, intakeMix, personStats,
-  repositories, reviewWaits, shippedMix, staleIssues, teamStats,
+  DEFAULT_BREAK_MINUTES, activityFeed, bugRatio, dailyCounts, daySessions,
+  hourlyCounts, intakeMix, personStats, repositories, reviewWaits, shippedMix,
+  staleIssues, teamStats,
 } from "./metrics";
 import { SOURCES, type SyncResult, isSource, sync } from "./sync";
 import index from "./ui/index.html";
@@ -24,17 +25,12 @@ function windowOf(url: string): Date | null {
 }
 
 /**
- * `?repo=` narrows to one repository. Three distinct cases, on purpose:
- *   absent   — the reader has expressed no preference, so `github.mainRepo` applies
- *   empty    — the reader explicitly asked for every repository
- *   a value  — that repository
- * Resolving the default here rather than in the browser keeps the first page load
- * to a single request, with no flash of the wrong scope.
+ * `?repo=` narrows the GitHub side to one repository. Absent or empty means all
+ * of them — which default a reader opens on is a browser preference now, so the
+ * server holds no opinion about it.
  */
 function repositoryOf(url: string): string | undefined {
-  const parameter = new URL(url).searchParams.get("repo");
-  if (parameter === null) return configuration.github?.mainRepo || undefined;
-  return parameter || undefined;
+  return new URL(url).searchParams.get("repo") || undefined;
 }
 
 /**
@@ -75,10 +71,11 @@ const server = Bun.serve({
 
       const repository = repositoryOf(req.url);
 
-      const [stats, waits, days, hours, team, ship, intake, bugs, stale, repos] = await Promise.all([
+      const [stats, waits, days, hours, sessions, team, ship, intake, bugs, stale, repos] =
+        await Promise.all([
         personStats(since, repository), reviewWaits(since, repository),
         dailyCounts(since, repository), hourlyCounts(since, timezone, repository),
-        teamStats(since, repository),
+        daySessions(since, timezone, repository), teamStats(since, repository),
         shippedMix(since, repository), intakeMix(since, repository),
         bugRatio(since, repository), staleIssues(), repositories(since),
       ]);
@@ -87,14 +84,14 @@ const server = Bun.serve({
         since: since.toISOString(),
         timezone,
         repository: repository ?? null,
-        mainRepository: configuration.github?.mainRepo ?? null,
         repositories: repos,
         people: configuration.people.map((person) => ({
           id: person.id,
           name: person.name,
           workWeek: person.workWeek,
         })),
-        team, stats, waits, days, hours, ship, intake, bugs, stale,
+        breakMinutes: DEFAULT_BREAK_MINUTES,
+        team, stats, waits, days, hours, sessions, ship, intake, bugs, stale,
       });
     },
 

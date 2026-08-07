@@ -17,8 +17,7 @@ export type Person = {
 };
 
 export type Config = {
-  /** `mainRepo` is only the dashboard's default filter — it never narrows a sync. */
-  github?: { org?: string; repos?: string[]; mainRepo?: string };
+  github?: { org?: string; repos?: string[] };
   slack?: { channels?: string[] };
   people: Person[];
 };

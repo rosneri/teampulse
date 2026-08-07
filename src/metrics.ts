@@ -230,6 +230,71 @@ export function hourlyCounts(since: Date, timezone: string, repository?: string)
     order by 1, 2, 3`;
 }
 
+/**
+ * A stretch of one person's day with no long silence in it. Minutes are counted
+ * from local midnight, so the reader's clock and the axis agree without either
+ * side re-deriving a timezone from a timestamp.
+ */
+export type DaySession = {
+  person_id: string;
+  day: string;
+  started_minute: number;
+  ended_minute: number;
+  events: number;
+};
+
+/**
+ * How long a silence has to be before it reads as a break rather than a person
+ * thinking. Events are instants — a commit, a merge, a message — so a session is
+ * only ever the visible edge of the work: an hour spent reading code produces
+ * nothing and looks exactly like lunch. Sixty minutes is the knob to turn when a
+ * team's rhythm makes it wrong; it is a parameter, not a constant, for that reason.
+ */
+export const DEFAULT_BREAK_MINUTES = 60;
+
+/**
+ * Each person's day broken into sessions: when they started, when they stopped,
+ * and how many events fell in between. Sessions never cross midnight — the
+ * calendar day is the unit being asked about, so a night that runs past it is
+ * two short days rather than one long session.
+ */
+export function daySessions(
+  since: Date,
+  timezone: string,
+  repository?: string,
+  breakMinutes: number = DEFAULT_BREAK_MINUTES,
+) {
+  return prisma.$queryRaw<DaySession[]>`
+    with local as (
+      select person_id, ts at time zone ${timezone} as local_ts
+      from activity
+      where ts >= ${since} ${inRepository(repository)}
+    ),
+    bounded as (
+      select person_id, local_ts, local_ts::date as day,
+        case
+          when local_ts - lag(local_ts) over (
+                 partition by person_id, local_ts::date order by local_ts
+               ) > make_interval(mins => ${breakMinutes}::int)
+          then 1 else 0
+        end as opens_session
+      from local
+    ),
+    sessioned as (
+      select person_id, day, local_ts,
+        sum(opens_session) over (partition by person_id, day order by local_ts) as session
+      from bounded
+    )
+    select person_id,
+      to_char(sessioned.day, 'YYYY-MM-DD') as day,
+      (extract(hour from min(local_ts)) * 60 + extract(minute from min(local_ts)))::int as started_minute,
+      (extract(hour from max(local_ts)) * 60 + extract(minute from max(local_ts)))::int as ended_minute,
+      count(*)::int as events
+    from sessioned
+    group by person_id, sessioned.day, session
+    order by person_id, day, started_minute`;
+}
+
 export type FeedRow = {
   id: string;
   source: string;

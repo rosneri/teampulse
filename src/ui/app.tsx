@@ -20,10 +20,16 @@ import { createRoot } from "react-dom/client";
 import type { BugRatio, Bucket, PersonStats, ReviewWait, TeamStats } from "../metrics";
 import { WORK_WEEK_LABELS, type WorkWeek, isWeekend, weekendDays } from "../workweek";
 import {
-  ActivityChart, type DailyRow, HOURS_IN_DAY, HoursHeatmap, type HoursRow, Meter, MixBar,
-  type MixSegment, type SeriesMember,
+  ActivityChart, type DailyRow, DayShape, type DaySpan, HOURS_IN_DAY, HoursHeatmap,
+  type HoursRow, Meter, MixBar, type MixSegment, type SeriesMember,
 } from "./charts";
-import { formatHourOfDay, formatHours, formatNumber, formatPercent, formatTimestamp } from "./format";
+import {
+  formatDayLabel, formatDuration, formatHourOfDay, formatHours, formatMinuteOfDay,
+  formatNumber, formatPercent, formatTimestamp,
+} from "./format";
+import {
+  BUILT_IN_VIEW, type SavedView, clearSavedView, readSavedView, sameView, writeSavedView,
+} from "./preferences";
 
 /* ------------------------------------------------------------------ payloads */
 
@@ -45,8 +51,6 @@ type TeamPayload = {
   timezone: string;
   /** Null when the reader has asked for every repository. */
   repository: string | null;
-  /** github.mainRepo from people.yaml — what the page opens on. */
-  mainRepository: string | null;
   repositories: RepositoryOption[];
   people: PersonReference[];
   team: TeamStats;
@@ -54,10 +58,21 @@ type TeamPayload = {
   waits: ReviewWait[];
   days: { person_id: string; day: string; n: number }[];
   hours: { person_id: string; day_of_week: number; hour: number; n: number }[];
+  sessions: DaySession[];
+  /** The silence that counts as a break, in minutes — the server's own threshold. */
+  breakMinutes: number;
   ship: Bucket[];
   intake: Bucket[];
   bugs: BugRatio;
   stale: StaleIssue[];
+};
+
+type DaySession = {
+  person_id: string;
+  day: string;
+  started_minute: number;
+  ended_minute: number;
+  events: number;
 };
 
 type TimelineEntry = {
@@ -242,6 +257,83 @@ function buildHourRows(
   }));
 }
 
+/**
+ * One person's days, newest first, every working day in the window present —
+ * including the ones with nothing on them. A day off is part of the shape of a
+ * week, and dropping it would quietly close the gap it makes.
+ */
+function buildDaySpans(
+  sinceIso: string,
+  sessions: DaySession[],
+  person: PersonReference,
+  hideWeekends: boolean,
+): DaySpan[] {
+  const byDate = new Map<string, DaySpan["sessions"]>();
+  for (const session of sessions) {
+    if (session.person_id !== person.id) continue;
+    const day = byDate.get(session.day) ?? [];
+    day.push({
+      startMinute: session.started_minute,
+      endMinute: session.ended_minute,
+      events: session.events,
+    });
+    byDate.set(session.day, day);
+  }
+
+  const firstDay = Date.parse(`${sinceIso.slice(0, 10)}T00:00:00Z`);
+  const lastDay = Date.parse(`${new Date().toISOString().slice(0, 10)}T00:00:00Z`);
+  const days: DaySpan[] = [];
+
+  for (let time = firstDay; time <= lastDay; time += DAY_IN_MILLISECONDS) {
+    const date = new Date(time).toISOString().slice(0, 10);
+    if (hideWeekends && isWeekend(date, person.workWeek)) continue;
+    days.push({ date, sessions: byDate.get(date) ?? [] });
+  }
+
+  return days.reverse();
+}
+
+const median = (values: number[]): number | null => {
+  if (!values.length) return null;
+  const sorted = [...values].sort((a, b) => a - b);
+  const middle = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 1
+    ? sorted[middle]!
+    : (sorted[middle - 1]! + sorted[middle]!) / 2;
+};
+
+type DaySummary = {
+  workedDays: number;
+  startMinute: number;
+  endMinute: number;
+  spanMinutes: number;
+  activeMinutes: number;
+  sessions: number;
+};
+
+/**
+ * The typical working day, over the days the person actually worked. Medians, not
+ * means: one all-nighter should not move where somebody's day usually starts.
+ */
+function summarizeDays(days: DaySpan[]): DaySummary | null {
+  const worked = days.filter((day) => day.sessions.length > 0);
+  if (!worked.length) return null;
+
+  const firstOf = (day: DaySpan) => day.sessions[0]!.startMinute;
+  const lastOf = (day: DaySpan) => day.sessions[day.sessions.length - 1]!.endMinute;
+  const activeOf = (day: DaySpan) =>
+    day.sessions.reduce((sum, session) => sum + (session.endMinute - session.startMinute), 0);
+
+  return {
+    workedDays: worked.length,
+    startMinute: Math.round(median(worked.map(firstOf)) ?? 0),
+    endMinute: Math.round(median(worked.map(lastOf)) ?? 0),
+    spanMinutes: Math.round(median(worked.map((day) => lastOf(day) - firstOf(day))) ?? 0),
+    activeMinutes: Math.round(median(worked.map(activeOf)) ?? 0),
+    sessions: Math.round(median(worked.map((day) => day.sessions.length)) ?? 0),
+  };
+}
+
 function useJson<T>(url: string | null) {
   const [data, setData] = useState<T | null>(null);
   const [pending, setPending] = useState(url !== null);
@@ -421,6 +513,100 @@ function RepositoryFilter({
   );
 }
 
+/** Undefined where storage is missing or blocked; the callers all tolerate it. */
+function browserStorage(): Storage | undefined {
+  return typeof window === "undefined" ? undefined : window.localStorage;
+}
+
+/**
+ * Pins the filter row as what the dashboard opens on. The button is the only
+ * thing that writes: changing a filter is not the same as choosing a default,
+ * and a page that silently remembered every fiddle would be impossible to
+ * return from.
+ */
+function DefaultViewControl({
+  current,
+  saved,
+  onSavedChange,
+}: {
+  current: SavedView;
+  saved: SavedView | null;
+  onSavedChange: (next: SavedView | null) => void;
+}) {
+  const [failed, setFailed] = useState(false);
+  const isSaved = saved !== null && sameView(current, saved);
+  const isBuiltIn = saved === null && sameView(current, BUILT_IN_VIEW);
+
+  return (
+    <div className="flex flex-col items-start gap-1">
+      <div className="flex items-center gap-2">
+        <button
+          type="button"
+          disabled={isSaved || isBuiltIn}
+          onClick={() => {
+            const stored = writeSavedView(browserStorage(), current);
+            setFailed(!stored);
+            if (stored) onSavedChange(current);
+          }}
+          className="cursor-pointer rounded-full border border-hairline bg-surface px-4 py-2 text-sm text-ink-primary hover:border-[var(--series-1)] disabled:cursor-default disabled:text-ink-muted disabled:hover:border-hairline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--series-1)]"
+        >
+          {isSaved ? "Saved as default" : "Save as default"}
+        </button>
+
+        {saved ? (
+          <button
+            type="button"
+            onClick={() => {
+              clearSavedView(browserStorage());
+              onSavedChange(null);
+              setFailed(false);
+            }}
+            className="cursor-pointer text-xs text-ink-secondary underline decoration-hairline underline-offset-4 hover:text-ink-primary focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--series-1)]"
+          >
+            Reset
+          </button>
+        ) : null}
+      </div>
+
+      {failed ? (
+        <p className="text-xs text-critical">
+          This browser would not store the preference.
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
+/** Whose day the shape card is showing. One person at a time: thirty rows each is a wall. */
+function PersonFilter({
+  people,
+  value,
+  onChange,
+}: {
+  people: PersonReference[];
+  value: string;
+  onChange: (next: string) => void;
+}) {
+  return (
+    <RadioGroup
+      value={value}
+      onChange={onChange}
+      aria-label="Person"
+      className="flex flex-wrap gap-1 rounded-full border border-hairline bg-surface p-1"
+    >
+      {people.map((person) => (
+        <Radio
+          key={person.id}
+          value={person.id}
+          className="cursor-pointer rounded-full px-3 py-1.5 text-sm text-ink-secondary select-none hover:text-ink-primary data-[checked]:bg-[var(--series-1)] data-[checked]:text-white data-[focus]:outline-2 data-[focus]:outline-offset-2 data-[focus]:outline-[var(--series-1)]"
+        >
+          {person.name}
+        </Radio>
+      ))}
+    </RadioGroup>
+  );
+}
+
 function WeekendToggle({ checked, onChange }: { checked: boolean; onChange: (next: boolean) => void }) {
   return (
     <Field className="flex items-center gap-2">
@@ -553,7 +739,7 @@ function HoursTableView({ rows }: { rows: HoursRow[] }) {
           <tr key={row.id} className="border-b border-hairline last:border-0">
             <td className="px-3 py-1.5 text-ink-secondary">{row.name}</td>
             {row.hours.map((count, hour) => (
-              <td key={hour} className={`px-2 py-1.5 text-right ${count ? "" : "text-ink-muted"}`}>
+              <td key={formatHourOfDay(hour)} className={`px-2 py-1.5 text-right ${count ? "" : "text-ink-muted"}`}>
                 {formatNumber(count)}
               </td>
             ))}
@@ -792,17 +978,19 @@ function PersonDialog({
 /* ----------------------------------------------------------------------- app */
 
 function App() {
-  const [range, setRange] = useState("30d");
-  const [hideWeekends, setHideWeekends] = useState(true);
+  // Read once, on the first render: a saved view is the page's starting point,
+  // not something that should reach in and change it later.
+  const [savedView, setSavedView] = useState(() => readSavedView(browserStorage()));
+  const openingView = savedView ?? BUILT_IN_VIEW;
+
+  const [range, setRange] = useState(openingView.range);
+  const [hideWeekends, setHideWeekends] = useState(openingView.hideWeekends);
+  const [repository, setRepository] = useState(openingView.repository);
   const [selectedPersonId, setSelectedPersonId] = useState<string | null>(null);
   const [reloadToken, setReloadToken] = useState(0);
 
-  // Null means "no preference yet", so the server applies github.mainRepo and
-  // tells us what it picked. Once the reader chooses, the parameter is always
-  // sent — an empty string being the explicit "all repositories".
-  const [repository, setRepository] = useState<string | null>(null);
-  const repositoryParameter =
-    repository === null ? "" : `&repo=${encodeURIComponent(repository)}`;
+  const currentView: SavedView = { range, repository, hideWeekends };
+  const repositoryParameter = `&repo=${encodeURIComponent(repository)}`;
 
   // The heat map's hours are bucketed in the reader's own zone, so the browser
   // says which one that is — the database stores UTC and knows nothing about it.
@@ -814,8 +1002,6 @@ function App() {
     `/api/team?since=${encodeURIComponent(range)}${repositoryParameter}` +
       `&tz=${encodeURIComponent(timezone)}&reload=${reloadToken}`,
   );
-
-  const activeRepository = repository ?? data?.repository ?? ALL_REPOSITORIES;
 
   const series = useMemo(() => (data ? assignSeries(data.people) : []), [data]);
   const dailyRows = useMemo(
@@ -852,11 +1038,12 @@ function App() {
         <div className="flex flex-wrap items-start gap-4">
           <WeekendToggle checked={hideWeekends} onChange={setHideWeekends} />
           <RepositoryFilter
-            value={activeRepository}
+            value={repository}
             options={data?.repositories ?? []}
             onChange={setRepository}
           />
           <RangeFilter value={range} onChange={setRange} />
+          <DefaultViewControl current={currentView} saved={savedView} onSavedChange={setSavedView} />
           <SyncButton range={range} onFinished={() => setReloadToken((token) => token + 1)} />
         </div>
       </header>

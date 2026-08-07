@@ -5,10 +5,13 @@ import { join } from "node:path";
 import { indexPeople, loadConfig, parseSince } from "../src/config";
 import { markSynced, prisma, replaceOpenIssues, saveActivities } from "../src/db";
 import {
-  activityFeed, bugRatio, dailyCounts, hourlyCounts, intakeMix, personStats,
-  repositories, reviewWaits, shippedMix, staleIssues, teamStats,
+  DEFAULT_BREAK_MINUTES, activityFeed, bugRatio, dailyCounts, daySessions, hourlyCounts,
+  intakeMix, personStats, repositories, reviewWaits, shippedMix, staleIssues, teamStats,
 } from "../src/metrics";
 import { arrivedViaPullRequest } from "../src/commitmessage";
+import {
+  BUILT_IN_VIEW, clearSavedView, readSavedView, sameView, writeSavedView,
+} from "../src/ui/preferences";
 import { isWeekend } from "../src/workweek";
 import { classify } from "../src/worktype";
 
@@ -428,4 +431,134 @@ test("hourlyCounts: bucketed by weekday and hour in the reader's zone", async ()
   expect(await hourlyCounts(since, "UTC", "acme/other")).toEqual([
     { person_id: "sam", day_of_week: 3, hour: 23, n: 1 },
   ]);
+});
+
+/** The parts of Storage the preferences module touches, with failure on demand. */
+function fakeStorage(options: { throwOn?: "get" | "set" | "remove" } = {}): Storage {
+  const entries = new Map<string, string>();
+  return {
+    getItem(key) {
+      if (options.throwOn === "get") throw new Error("blocked");
+      return entries.get(key) ?? null;
+    },
+    setItem(key, value) {
+      if (options.throwOn === "set") throw new Error("quota exceeded");
+      entries.set(key, value);
+    },
+    removeItem(key) {
+      if (options.throwOn === "remove") throw new Error("blocked");
+      entries.delete(key);
+    },
+    clear: () => entries.clear(),
+    key: (index) => [...entries.keys()][index] ?? null,
+    get length() {
+      return entries.size;
+    },
+  } as Storage;
+}
+
+test("saved view: a round trip, and a reset", () => {
+  const storage = fakeStorage();
+  const view = { range: "7d", repository: "acme/web", hideWeekends: false };
+
+  expect(readSavedView(storage)).toBeNull();
+  expect(writeSavedView(storage, view)).toBe(true);
+  expect(readSavedView(storage)).toEqual(view);
+
+  clearSavedView(storage);
+  expect(readSavedView(storage)).toBeNull();
+});
+
+test("saved view: anything malformed falls back rather than half-applying", () => {
+  const storage = fakeStorage();
+  const stored = (value: string) => {
+    storage.setItem("teampulse.defaultView", value);
+    return readSavedView(storage);
+  };
+
+  expect(stored("not json at all")).toBeNull();
+  expect(stored("null")).toBeNull();
+  expect(stored('"a string"')).toBeNull();
+  // Every field is required, and of the right type.
+  expect(stored('{"repository":"","hideWeekends":true}')).toBeNull();
+  expect(stored('{"range":"","repository":"","hideWeekends":true}')).toBeNull();
+  expect(stored('{"range":"30d","hideWeekends":true}')).toBeNull();
+  expect(stored('{"range":"30d","repository":"","hideWeekends":"yes"}')).toBeNull();
+  // Unknown extras are dropped rather than carried through.
+  expect(stored('{"range":"30d","repository":"","hideWeekends":true,"extra":1}')).toEqual({
+    range: "30d",
+    repository: "",
+    hideWeekends: true,
+  });
+});
+
+test("saved view: storage that is absent or blocked never breaks the page", () => {
+  const view = { range: "30d", repository: "", hideWeekends: true };
+
+  // No storage at all — server-side render, or a browser without it.
+  expect(readSavedView(undefined)).toBeNull();
+  expect(writeSavedView(undefined, view)).toBe(false);
+  expect(clearSavedView(undefined)).toBeUndefined();
+
+  // Private browsing throws on access rather than returning null.
+  expect(readSavedView(fakeStorage({ throwOn: "get" }))).toBeNull();
+  expect(writeSavedView(fakeStorage({ throwOn: "set" }), view)).toBe(false);
+  expect(clearSavedView(fakeStorage({ throwOn: "remove" }))).toBeUndefined();
+});
+
+test("sameView and the built-in default", () => {
+  expect(BUILT_IN_VIEW).toEqual({ range: "30d", repository: "", hideWeekends: true });
+
+  expect(sameView(BUILT_IN_VIEW, { ...BUILT_IN_VIEW })).toBe(true);
+  expect(sameView(BUILT_IN_VIEW, { ...BUILT_IN_VIEW, range: "7d" })).toBe(false);
+  expect(sameView(BUILT_IN_VIEW, { ...BUILT_IN_VIEW, repository: "acme/web" })).toBe(false);
+  expect(sameView(BUILT_IN_VIEW, { ...BUILT_IN_VIEW, hideWeekends: false })).toBe(false);
+});
+
+test("daySessions: a long enough silence splits the day, midnight always does", async () => {
+  await saveActivities([
+    // Morning session: three events, none more than an hour apart.
+    { id: "s1", source: "github", type: "commit_pushed", personId: "maya",
+      ts: "2026-07-15T06:00:00.000Z" },
+    { id: "s2", source: "github", type: "commit_pushed", personId: "maya",
+      ts: "2026-07-15T06:40:00.000Z" },
+    { id: "s3", source: "slack", type: "message", personId: "maya",
+      ts: "2026-07-15T07:30:00.000Z" },
+    // Back after a two-hour gap: a second session, not a longer first one.
+    { id: "s4", source: "github", type: "commit_pushed", personId: "maya",
+      ts: "2026-07-15T09:30:00.000Z" },
+    // Just before and just after local midnight: two days, never one session.
+    { id: "s5", source: "slack", type: "message", personId: "sam",
+      ts: "2026-07-15T23:50:00.000Z" },
+    { id: "s6", source: "slack", type: "message", personId: "sam",
+      ts: "2026-07-16T00:10:00.000Z" },
+  ]);
+  const since = new Date("2026-07-01T00:00:00.000Z");
+
+  const sessions = await daySessions(since, "UTC");
+  expect(sessions).toEqual([
+    { person_id: "maya", day: "2026-07-15", started_minute: 360, ended_minute: 450, events: 3 },
+    { person_id: "maya", day: "2026-07-15", started_minute: 570, ended_minute: 570, events: 1 },
+    { person_id: "sam", day: "2026-07-15", started_minute: 1430, ended_minute: 1430, events: 1 },
+    { person_id: "sam", day: "2026-07-16", started_minute: 10, ended_minute: 10, events: 1 },
+  ]);
+
+  // A wider break threshold folds the two-hour gap back into one session.
+  const relaxed = await daySessions(since, "UTC", undefined, 180);
+  expect(relaxed.filter((row) => row.person_id === "maya")).toEqual([
+    { person_id: "maya", day: "2026-07-15", started_minute: 360, ended_minute: 570, events: 4 },
+  ]);
+
+  // The default threshold is the one the no-argument call uses.
+  expect(DEFAULT_BREAK_MINUTES).toBe(60);
+  expect(await daySessions(since, "UTC", undefined, DEFAULT_BREAK_MINUTES)).toEqual(sessions);
+
+  // The zone shifts both the clock and which calendar day an event lands on.
+  const local = await daySessions(since, "Asia/Jerusalem");
+  expect(local[0]).toEqual({
+    person_id: "maya", day: "2026-07-15", started_minute: 540, ended_minute: 630, events: 3,
+  });
+
+  // Repository scope reaches here too, and events with no repository survive it.
+  expect(await daySessions(since, "UTC", "acme/web")).toEqual(sessions);
 });

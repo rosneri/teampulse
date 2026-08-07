@@ -1,5 +1,8 @@
 import { Bar, BarChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
-import { formatDayTick, formatHourOfDay, formatNumber, formatPercent } from "./format";
+import {
+  formatDayLabel, formatDayTick, formatDuration, formatHourOfDay, formatMinuteOfDay,
+  formatNumber, formatPercent,
+} from "./format";
 
 /**
  * Every colour below is a CSS custom property from index.css, so light and dark
@@ -298,7 +301,7 @@ export function HoursHeatmap({ rows }: { rows: HoursRow[] }) {
               <div className="grid flex-1 gap-0.5" style={hourColumns}>
                 {row.hours.map((count, hour) => (
                   <div
-                    key={hour}
+                    key={formatHourOfDay(hour)}
                     className="h-5 rounded-[2px]"
                     style={{ background: heatFill(count, peak) }}
                     title={`${row.name} · ${formatHourOfDay(hour)} — ${formatNumber(count)} events`}
@@ -332,6 +335,105 @@ export function HoursHeatmap({ rows }: { rows: HoursRow[] }) {
         </div>
 
         <HeatLegend />
+      </div>
+    </div>
+  );
+}
+
+/** One person's calendar day: the stretches they were working, in order. */
+export type DaySpan = {
+  date: string;
+  sessions: { startMinute: number; endMinute: number; events: number }[];
+};
+
+const MINUTES_IN_DAY = HOURS_IN_DAY * 60;
+
+/** A session of a single event has no width of its own; it still has to be visible. */
+const MINIMUM_BLOCK_WIDTH = "3px";
+
+/**
+ * One row per day, each session drawn where it actually happened against a 24-hour
+ * track. What the eye is meant to catch is the *gaps* — the track showing through
+ * between two blocks is a break, and its length is read off the axis.
+ *
+ * Blocks are the visible edge of the work, not the work: an hour spent reading
+ * code emits no events and is indistinguishable from lunch. The card says so.
+ */
+export function DayShape({ days, breakMinutes }: { days: DaySpan[]; breakMinutes: number }) {
+  if (!days.length) {
+    return <p className="py-12 text-center text-sm text-ink-muted">No activity in this window.</p>;
+  }
+
+  return (
+    <div className="overflow-x-auto">
+      <div className="min-w-xl">
+        {days.map((day) => {
+          const first = day.sessions[0];
+          const last = day.sessions[day.sessions.length - 1];
+
+          return (
+            <div key={day.date} className="flex items-center gap-3 py-0.5">
+              <div className="w-24 shrink-0 text-xs tabular-nums text-ink-secondary">
+                {formatDayLabel(day.date)}
+              </div>
+
+              <div className="relative h-5 flex-1 overflow-hidden rounded-[2px]" style={{ background: "var(--gridline)" }}>
+                {day.sessions.map((session) => (
+                  <div
+                    key={session.startMinute}
+                    className="absolute inset-y-0 rounded-[2px]"
+                    style={{
+                      background: "var(--series-1)",
+                      left: `${(session.startMinute / MINUTES_IN_DAY) * 100}%`,
+                      width: `max(${MINIMUM_BLOCK_WIDTH}, ${((session.endMinute - session.startMinute) / MINUTES_IN_DAY) * 100}%)`,
+                    }}
+                    title={
+                      `${formatMinuteOfDay(session.startMinute)} → ${formatMinuteOfDay(session.endMinute)} · ` +
+                      `${formatDuration(session.endMinute - session.startMinute)} · ` +
+                      `${formatNumber(session.events)} events`
+                    }
+                  />
+                ))}
+              </div>
+
+              <div className="w-44 shrink-0 text-right text-xs tabular-nums text-ink-secondary">
+                {first && last ? (
+                  <>
+                    {formatMinuteOfDay(first.startMinute)} → {formatMinuteOfDay(last.endMinute)}
+                    <span className="text-ink-muted">
+                      {" "}
+                      · {formatDuration(last.endMinute - first.startMinute)}
+                    </span>
+                  </>
+                ) : (
+                  <span className="text-ink-muted">no activity</span>
+                )}
+              </div>
+            </div>
+          );
+        })}
+
+        <div className="flex items-center gap-3 pt-1">
+          <div className="w-24 shrink-0" />
+          <div className="grid flex-1" style={hourColumns}>
+            {Array.from({ length: HOURS_IN_DAY }, (_, hour) =>
+              hour % AXIS_TICK_EVERY === 0 ? (
+                <div
+                  key={formatHourOfDay(hour)}
+                  className="text-xs tabular-nums text-ink-muted"
+                  style={{ gridColumn: `span ${AXIS_TICK_EVERY}` }}
+                >
+                  {formatHourOfDay(hour)}
+                </div>
+              ) : null,
+            )}
+          </div>
+          <div className="w-44 shrink-0" />
+        </div>
+
+        <p className="mt-4 text-xs text-ink-muted">
+          A gap of more than {formatDuration(breakMinutes)} between events starts a new block.
+        </p>
       </div>
     </div>
   );
