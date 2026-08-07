@@ -91,6 +91,19 @@ a visible gap.
 Shipped mix and intake mix are counted over different event types on purpose, so
 a PR and the Linear issue it closes are never both counted as one delivery.
 
+## Known behavior
+
+Narrowing the scope in `people.yaml` (adding `github.org`, trimming `repos`,
+removing a person) does **not** retroactively remove rows an earlier, wider sync
+already wrote — `sync` only inserts. Numbers will keep counting the old scope
+until you clear them. The activity table is a rebuildable cache, so the fix is to
+drop the out-of-scope rows and re-sync:
+
+```sql
+delete from activity
+where source = 'github' and meta ->> 'repo' not like 'YourOrg/%';
+```
+
 ## What's deliberately absent
 
 - **No cross-person leaderboard.** Deltas compare a person against their own
