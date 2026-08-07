@@ -1,0 +1,21 @@
+# Copy to people.yaml and fill in. people.yaml is gitignored — real handles
+# never reach the repo.
+
+github:
+  org: YourOrg            # or list explicit repos instead:
+  # repos: [YourOrg/api, YourOrg/web]
+
+slack:
+  # Empty = every channel you're a member of, plus all DMs with the people below.
+  # A user token only reaches conversations you belong to, so anything said in a
+  # channel you never joined stays invisible.
+  channels: []
+  # Narrow it by listing names or channel IDs:
+  # channels: [eng, product, C01ABCDEF]
+
+people:
+  - id: example           # canonical id, used everywhere in the database
+    name: Example Person
+    github: octocat       # GitHub login
+    linear: ""            # Linear user UUID — see README for the lookup query
+    slack: ""             # Slack user ID, e.g. U01ABCDEF

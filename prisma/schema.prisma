@@ -1,0 +1,72 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+/// Facts. Every source collapses into this one table.
+/// Nothing downstream (metrics, prompts, dashboard) knows what GitHub or Slack is.
+model Activity {
+  /// "<source>:<type>:<native id>" — stable across re-syncs, so sync is idempotent.
+  id       String   @id
+  source   String
+  type     String
+  personId String   @map("person_id")
+  /// bug | feature | improvement | chore | other. Null = not classifiable yet.
+  workType String?  @map("work_type")
+  ts       DateTime @db.Timestamptz(3)
+  url      String?
+  title    String?
+  body     String?
+  meta     Json?
+
+  @@index([personId, ts(sort: Desc)])
+  @@index([type, ts(sort: Desc)])
+  @@index([workType, ts(sort: Desc)])
+  @@index([ts(sort: Desc)])
+  @@map("activity")
+}
+
+/// Current open Linear assignments. Not activity — it has no event timestamp of
+/// its own. A snapshot, replaced wholesale each sync. Feeds the stale check.
+model OpenIssue {
+  id         String   @id
+  identifier String
+  title      String
+  url        String
+  personId   String   @map("person_id")
+  state      String
+  workType   String?  @map("work_type")
+  priority   Int      @default(0)
+  updatedAt  DateTime @map("updated_at") @db.Timestamptz(3)
+  syncedAt   DateTime @default(now()) @map("synced_at") @db.Timestamptz(3)
+
+  @@index([personId])
+  @@map("open_issue")
+}
+
+/// Judgment, kept strictly apart from facts. Written by the AI layer only.
+/// inputDigest hashes exactly what the model was shown, so any claim is traceable.
+model AiOutput {
+  id          BigInt   @id @default(autoincrement())
+  kind        String
+  personId    String   @map("person_id")
+  windowStart DateTime @map("window_start") @db.Timestamptz(3)
+  windowEnd   DateTime @map("window_end") @db.Timestamptz(3)
+  inputDigest String   @map("input_digest")
+  payload     Json
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@index([personId, kind, createdAt(sort: Desc)])
+  @@map("ai_output")
+}
+
+model SyncRun {
+  source  String   @id
+  lastRun DateTime @map("last_run") @db.Timestamptz(3)
+
+  @@map("sync_run")
+}
