@@ -1,0 +1,11 @@
+node_modules/
+src/generated/
+.env
+.env.*
+!.env.example
+
+# Real roster: teammate handles stay out of git.
+people.yaml
+
+*.html
+!template*.html
