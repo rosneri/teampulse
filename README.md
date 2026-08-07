@@ -77,22 +77,35 @@ curl -s "https://slack.com/api/users.list" -H "authorization: Bearer $SLACK_USER
 bun run ui                            # http://localhost:3737
 ```
 
-The web UI is the only controller. Everything happens there:
+The web UI is the only controller. It opens on the last **30 days**, **all
+repositories**, with **hide weekends** on, unless a default view has been saved.
+Everything happens there:
 
 - **Sync now** pulls all three sources for the selected window and reports what
   each one collected. A failing source is reported and skipped — one expired
   token doesn't cost you the other two.
 - **Date range** scopes every number, chart and table on the page.
-- **Repository** narrows the GitHub side to one repository, opening on
-  `github.mainRepo` from `people.yaml`. Only GitHub events belong to a
-  repository; Linear issues and Slack messages happen in none, so they are
-  counted under every repository rather than dropped — otherwise picking one
-  would zero out intake, bugs and conversation, and read as if the team had
-  stopped talking. Pick **All repositories** for the unscoped view.
+- **Repository** narrows the GitHub side to one repository. Only GitHub events
+  belong to a repository; Linear issues and Slack messages happen in none, so
+  they are counted under every repository rather than dropped — otherwise
+  picking one would zero out intake, bugs and conversation, and read as if the
+  team had stopped talking.
+- **Save as default** pins the current date range, repository and weekend toggle
+  as what the dashboard opens on. **Reset** goes back to the built-in view.
+  Only the button writes: changing a filter is not the same as choosing a
+  default, and a page that quietly remembered every fiddle would be hard to get
+  back from. The preference lives in the browser's own storage — it is one
+  person's habit on one machine, not a fact about the team, so it belongs in
+  neither the database nor `people.yaml`. A stored value that is malformed or
+  from an older version is discarded rather than half-applied.
 - **Hide weekends**, on by default, drops non-working days from the activity
   strip *per person*, using each person's `workWeek` from `people.yaml`. A
   Friday off in Tel Aviv is an ordinary working day in Berlin, so a day only
   leaves the axis when it is a weekend for everybody.
+- **Work hours** shows when each person is active, one row per person, one cell
+  per hour of the day. Hours are read in the browser's own timezone, and each
+  row is shaded against that person's own busiest hour — the grid answers *when*
+  somebody works, not how much. Hide weekends applies here too.
 - **Selecting a person** opens their stats and their last 40 events.
 
 `PORT` overrides the port. The server binds localhost and has no authentication;
@@ -201,7 +214,8 @@ connection. `.mcp.json` registers it for MCP clients that read one:
 ```
 
 Tools: `people`, `team_stats`, `person_stats`, `review_waits`, `shipped_mix`,
-`intake_mix`, `bug_ratio`, `daily_counts`, `stale_issues`, `activity`.
+`intake_mix`, `bug_ratio`, `daily_counts`, `hourly_counts`, `stale_issues`,
+`activity`.
 
 It is **read-only on purpose**. There is no sync tool: pulling from GitHub,
 Linear and Slack is a person's decision, and the UI is where it is made. Every

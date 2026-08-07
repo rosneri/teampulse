@@ -5,11 +5,6 @@ github:
   org: YourOrg            # or list explicit repos instead:
   # repos: [YourOrg/api, YourOrg/web]
 
-  # The repository the dashboard opens on. Omit it to open on all of them.
-  # This is only the default for the UI's repository filter — sync always pulls
-  # everything the org/repos scope above covers.
-  mainRepo: YourOrg/main-app
-
 slack:
   # Empty = every channel you're a member of, plus all DMs with the people below.
   # A user token only reaches conversations you belong to, so anything said in a
