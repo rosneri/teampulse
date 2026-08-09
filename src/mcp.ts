@@ -250,6 +250,9 @@ server.registerTool(
       "window, a 'work_type' proposal is a guess at what unclassified merged PRs and created " +
       "issues were, and a 'focus' reading is an opinion on how somebody's window lines up with the " +
       "priorities daily_focus lists — an opinion about two lists, never a grade of the person. " +
+      "A 'daily_message' is the draft of the update a manager posts to their team, written from " +
+      "every brief at once: it is the one row here about the team rather than a person, so its " +
+      "person_id is null, and it is a draft nobody has sent. " +
       "Proposals are never written back to activity, so shipped_mix and intake_mix keep " +
       "reporting those items as unclassified — do not add these to a count or reconcile them against " +
       "one. Each row carries the window it judged, which may be narrower or older than the one you " +

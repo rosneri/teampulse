@@ -95,11 +95,12 @@ export async function replaceAiUsage(rows: AiUsageRow[]): Promise<number> {
 }
 
 /** What the AI layer is allowed to have an opinion about. */
-export type AiOutputKind = "summary" | "work_type" | "focus";
+export type AiOutputKind = "summary" | "work_type" | "focus" | "daily_message";
 
 export type AiOutputRow = {
   kind: AiOutputKind;
-  personId: string;
+  /** Null for a judgment about the team rather than a person — the daily message. */
+  personId: string | null;
   windowStart: Date;
   windowEnd: Date;
   /** sha-256 of the exact prompt the model was shown, so a claim can be traced to its input. */
@@ -121,7 +122,7 @@ export async function saveAiOutput(row: AiOutputRow): Promise<void> {
  * means the model has already answered this question about this person and
  * asking again would only cost money.
  */
-export function findAiOutput(kind: AiOutputKind, personId: string, inputDigest: string) {
+export function findAiOutput(kind: AiOutputKind, personId: string | null, inputDigest: string) {
   return prisma.aiOutput.findFirst({
     where: { kind, personId, inputDigest },
     orderBy: { createdAt: "desc" },
