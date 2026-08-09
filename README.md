@@ -151,6 +151,20 @@ Everything happens there:
   Someone with nothing stated and nothing assigned is not judged at all, and
   costs nothing: there is no pair of lists to compare.
 
+  **Draft daily message** is the third, and the only thing on this dashboard
+  written to leave it: the end-of-day update you post to your team, drafted from
+  every brief at once and shown as the exact text the Copy button hands over.
+  It is organised by the work rather than by person — a section per person is a
+  scoreboard, and nothing here ranks people — and it is numbered in one running
+  sequence across sections, so a teammate can answer "re 3" and mean one thing.
+  The numbering happens when the text is rendered, not in the model's head.
+
+  Its row in `ai_output` is the only judgment about nobody in particular, so its
+  `person_id` is null rather than a placeholder id. A window where nothing
+  surfaced anywhere produces no message and costs nothing — there is no day to
+  write up. It drafts and stops: teampulse has never sent anything anywhere, and
+  whether a word of it is true enough to post is your call.
+
 - **Judgment** is the one card on the page no number comes from. **Run judgment**
   asks a model two questions about each person — what their window was about, and
   what kind of work the unclassified merged PRs and created issues were — and
@@ -167,7 +181,8 @@ Everything happens there:
 - **Selecting a person** opens their stats and their last 40 events.
 
 `PORT` overrides the port. The server binds localhost and has no authentication;
-`POST /api/sync`, `POST /api/judge`, `POST /api/judge/focus` and
+`POST /api/sync`, `POST /api/judge`, `POST /api/judge/focus`,
+`POST /api/judge/daily-message` and
 `POST|DELETE /api/focus/:id` change state, so they need an auth layer before any
 of them is ever exposed beyond the machine it runs on.
 

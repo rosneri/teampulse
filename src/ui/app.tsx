@@ -26,8 +26,8 @@ import {
   type HoursRow, Meter, MixBar, type MixSegment, type SeriesMember,
 } from "./charts";
 import {
-  formatDayLabel, formatDuration, formatHourOfDay, formatHours, formatMinuteOfDay,
-  formatMoney, formatNumber, formatPercent, formatTimestamp,
+  formatDailyMessage, formatDayLabel, formatDuration, formatHourOfDay, formatHours,
+  formatMinuteOfDay, formatMoney, formatNumber, formatPercent, formatTimestamp,
 } from "./format";
 import {
   BUILT_IN_VIEW, type SavedView, clearSavedView, readSavedView, sameView, writeSavedView,
@@ -152,11 +152,29 @@ type StoredFocusReading = {
   payload: FocusReading;
 };
 
+/** The drafted team update. About the team, so it belongs to no person id. */
+type DailyMessage = {
+  headline: string;
+  shipped: string[];
+  inFlight: string[];
+  waiting: string[];
+};
+
+type StoredDailyMessage = {
+  personId: null;
+  windowStart: string;
+  windowEnd: string;
+  createdAt: string;
+  kind: "daily_message";
+  payload: DailyMessage;
+};
+
 type FocusPayload = {
   since: string;
   repository: string | null;
   briefs: FocusBrief[];
   judgments: StoredFocusReading[];
+  message: StoredDailyMessage | null;
 };
 
 type DayMarkRow = {
@@ -1525,6 +1543,83 @@ function FocusCheckButton({ range, onFinished }: { range: string; onFinished: ()
   );
 }
 
+/**
+ * The third thing on this page that spends money, and the only one that writes
+ * something meant to leave the building. It drafts; a person sends, or does not.
+ */
+function DraftMessageButton({ range, onFinished }: { range: string; onFinished: () => void }) {
+  const [running, setRunning] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function draft() {
+    setRunning(true);
+    setError(null);
+    try {
+      const response = await fetch(`/api/judge/daily-message?since=${encodeURIComponent(range)}`, {
+        method: "POST",
+      });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload?.error ?? response.statusText);
+      // A window with nothing in it anywhere returns no message at all, which is
+      // an answer rather than a failure: there is no day here to write up.
+      if (!payload.message) throw new Error("nothing surfaced in this window to write up");
+      if (payload.message.error) throw new Error(payload.message.error);
+      onFinished();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setRunning(false);
+    }
+  }
+
+  return (
+    <div className="flex flex-col items-end gap-1">
+      <button
+        type="button"
+        onClick={draft}
+        disabled={running}
+        className="cursor-pointer rounded-full border border-hairline bg-surface px-4 py-2 text-sm text-ink-primary hover:border-[var(--series-1)] disabled:cursor-progress disabled:text-ink-muted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--series-1)]"
+      >
+        {running ? "Drafting…" : "Draft daily message"}
+      </button>
+
+      {error ? <p className="text-xs text-critical">{error}</p> : null}
+    </div>
+  );
+}
+
+/**
+ * The draft, shown as the exact text that gets copied rather than a prettier
+ * rendering of it. The numbering is the reason: a teammate replies "re 3", so
+ * what is on screen and what lands in the chat window are the same characters.
+ */
+function DailyMessageBlock({ message }: { message: StoredDailyMessage }) {
+  const [copied, setCopied] = useState(false);
+  const text = formatDailyMessage(message.payload, new Date(message.windowEnd));
+
+  return (
+    <div className="mb-6 rounded-xl border border-hairline bg-plane p-4">
+      <div className="flex flex-wrap items-baseline justify-between gap-2">
+        <p className="text-xs text-ink-muted">
+          Drafted {formatTimestamp(message.createdAt)} from the window starting{" "}
+          {formatTimestamp(message.windowStart)}. A draft: nothing here sends it.
+        </p>
+        <button
+          type="button"
+          onClick={() => {
+            navigator.clipboard.writeText(text).then(() => setCopied(true));
+          }}
+          className="cursor-pointer rounded-full border border-hairline bg-surface px-3 py-1.5 text-xs text-ink-primary hover:border-[var(--series-1)] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--series-1)]"
+        >
+          {copied ? "Copied" : "Copy"}
+        </button>
+      </div>
+
+      <pre className="mt-3 font-sans text-sm whitespace-pre-wrap text-ink-primary">{text}</pre>
+    </div>
+  );
+}
+
 function FocusPerson({
   brief,
   reading,
@@ -1681,10 +1776,15 @@ function FocusCard({ repository }: { repository: string }) {
           ))}
         </RadioGroup>
 
-        <FocusCheckButton range={range} onFinished={reload} />
+        <div className="flex flex-wrap items-start gap-2">
+          <DraftMessageButton range={range} onFinished={reload} />
+          <FocusCheckButton range={range} onFinished={reload} />
+        </div>
       </div>
 
       {error ? <p className="text-sm text-critical">{error}</p> : null}
+
+      {data?.message ? <DailyMessageBlock message={data.message} /> : null}
 
       {data ? (
         <div className={`space-y-6 ${pending ? "opacity-60" : ""}`}>

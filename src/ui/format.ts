@@ -44,3 +44,32 @@ export const formatDayLabel = (isoDate: string) => {
 /** "2026-07-08T14:31:02.000Z" -> "2026-07-08 14:31". */
 export const formatTimestamp = (isoTimestamp: string) =>
   isoTimestamp.slice(0, 16).replace("T", " ");
+
+/**
+ * The drafted team update as the text a manager pastes into a chat window.
+ *
+ * Numbered in one running sequence across every section rather than per section,
+ * so a teammate can answer "re 3" and mean one thing. The model is never asked to
+ * count — it returns lines, and the numbering happens here, where it cannot drift.
+ * An empty section is left out entirely: a heading with nothing under it is a
+ * question the reader has to stop and answer.
+ */
+export function formatDailyMessage(
+  message: { headline: string; shipped: string[]; inFlight: string[]; waiting: string[] },
+  day: Date = new Date(),
+): string {
+  const heading = day.toLocaleDateString("en-US", { weekday: "long", day: "numeric", month: "short" });
+  const lines = [`**Daily update — ${heading}**`, "", message.headline];
+
+  let number = 0;
+  for (const [title, items] of [
+    ["Shipped", message.shipped],
+    ["In flight", message.inFlight],
+    ["Waiting", message.waiting],
+  ] as const) {
+    if (!items.length) continue;
+    lines.push("", `*${title}*`, ...items.map((item) => `${++number}. ${item}`));
+  }
+
+  return lines.join("\n");
+}

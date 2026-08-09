@@ -75,7 +75,10 @@ model PersonFocus {
 model AiOutput {
   id          BigInt   @id @default(autoincrement())
   kind        String
-  personId    String   @map("person_id")
+  /// Who the judgment is about. Null when it is about nobody in particular —
+  /// the daily message reads the whole team's day and belongs to no one person,
+  /// and a placeholder id would make it look like it did.
+  personId    String?  @map("person_id")
   windowStart DateTime @map("window_start") @db.Timestamptz(3)
   windowEnd   DateTime @map("window_end") @db.Timestamptz(3)
   inputDigest String   @map("input_digest")

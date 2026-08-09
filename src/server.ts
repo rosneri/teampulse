@@ -1,7 +1,7 @@
 import { indexPeople, loadConfig, parseSince } from "./config";
 import { clearPersonFocus, setPersonFocus } from "./db";
 import { focusBriefs } from "./focus";
-import { judge, judgeFocus, storedJudgments } from "./judgment";
+import { dailyMessage, judge, judgeFocus, storedJudgments } from "./judgment";
 import {
   DEFAULT_BREAK_MINUTES, activityFeed, aiUsage, bugRatio, coverage, dailyCounts,
   daySessions, dayMarks, hourlyCounts, intakeMix, lastSyncs, personStats,
@@ -212,6 +212,9 @@ const server = Bun.serve({
         // Read only: a reading is produced by POST /api/judge/focus, never by
         // loading the page — this is the endpoint that costs nothing.
         judgments: judgments.filter((judgment) => judgment.kind === "focus"),
+        // The last draft, whenever it was drafted. It carries its own window for
+        // that reason: a message drafted this morning is not about this evening.
+        message: judgments.find((judgment) => judgment.kind === "daily_message") ?? null,
       });
     },
 
@@ -264,6 +267,28 @@ const server = Bun.serve({
         });
         const judgments = await judgeFocus({ briefs, since });
         return Response.json({ since: since.toISOString(), judgments });
+      },
+    },
+
+    /**
+     * Drafts the update a manager posts to their team at the end of a day, from
+     * the same briefs the card above shows. One call for the whole team, because
+     * the message is one message — and a draft only: this server has never sent
+     * anything anywhere, and the person who asked for it is the one who decides
+     * whether a word of it is true enough to post.
+     */
+    "/api/judge/daily-message": {
+      POST: async (req) => {
+        const since = windowOf(req.url, "1d");
+        if (!since) return bad("bad ?since — use 1d, 7d, or a date");
+
+        const briefs = await focusBriefs({
+          people: configuration.people,
+          since,
+          repository: repositoryOf(req.url),
+        });
+        const message = await dailyMessage({ briefs, since });
+        return Response.json({ since: since.toISOString(), message });
       },
     },
 

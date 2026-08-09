@@ -13,6 +13,10 @@ import {
   lastSyncs, unclassifiedWork,
 } from "../src/metrics";
 import { focusBriefs } from "../src/focus";
+import {
+  formatDailyMessage, formatDayLabel, formatDayTick, formatDuration, formatHourOfDay, formatHours,
+  formatMinuteOfDay, formatMoney, formatNumber, formatPercent, formatTimestamp,
+} from "../src/ui/format";
 import { priorityLabel } from "../src/priority";
 import { arrivedViaPullRequest } from "../src/commitmessage";
 import {
@@ -968,4 +972,42 @@ test("collectVercel: pages through deployments, credits by username then email",
   } finally {
     globalThis.fetch = realFetch;
   }
+});
+
+test("formatDailyMessage: one running sequence across sections, empty ones left out", () => {
+  const text = formatDailyMessage(
+    {
+      headline: "Mostly the exporter, plus the login fix landing.",
+      shipped: ["Login redirect fixed (ENG-88) — Maya"],
+      inFlight: ["Exporter rewrite — Sam, behind the flag until Thursday"],
+      waiting: [],
+    },
+    new Date("2026-08-09T18:00:00.000Z"),
+  );
+
+  expect(text).toContain("**Daily update — Sunday, Aug 9**");
+  // Numbered across sections, not restarted per section, and never renumbered by
+  // a model: 2 belongs to In flight because 1 was spent in Shipped.
+  expect(text).toContain("1. Login redirect fixed (ENG-88) — Maya");
+  expect(text).toContain("2. Exporter rewrite — Sam, behind the flag until Thursday");
+  // A heading with nothing under it is a question the reader has to answer.
+  expect(text).not.toContain("Waiting");
+});
+
+test("the dashboard's formatters, including every absence and every threshold", () => {
+  expect(formatNumber(12_400)).toBe("12,400");
+  // An unknown share is a visible gap. Rendering it as 0% would be a claim.
+  expect(formatPercent(null)).toBe("—");
+  expect(formatPercent(0.256)).toBe("26%");
+  expect(formatHours(undefined)).toBe("—");
+  expect(formatHours(4.25)).toBe("4.3h");
+  expect(formatHours(60)).toBe("2.5d");
+  expect(formatDayTick("2026-07-08")).toBe("07-08");
+  expect(formatHourOfDay(9)).toBe("09:00");
+  expect(formatMinuteOfDay(639)).toBe("10:39");
+  expect(formatDuration(42)).toBe("42m");
+  expect(formatDuration(222)).toBe("3h 42m");
+  expect(formatMoney(186, "USD")).toBe("$1.86");
+  expect(formatDayLabel("2026-07-27")).toBe("Mon 07-27");
+  expect(formatTimestamp("2026-07-08T14:31:02.000Z")).toBe("2026-07-08 14:31");
 });
