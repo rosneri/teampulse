@@ -61,6 +61,8 @@ export async function replaceOpenIssues(rows: OpenIssue[]): Promise<number> {
         state: i.state,
         workType: i.workType ?? null,
         priority: i.priority,
+        projectName: i.projectName ?? null,
+        initiativeName: i.initiativeName ?? null,
         updatedAt: new Date(i.updatedAt),
       })),
     }),
@@ -93,7 +95,7 @@ export async function replaceAiUsage(rows: AiUsageRow[]): Promise<number> {
 }
 
 /** What the AI layer is allowed to have an opinion about. */
-export type AiOutputKind = "summary" | "work_type";
+export type AiOutputKind = "summary" | "work_type" | "focus";
 
 export type AiOutputRow = {
   kind: AiOutputKind;
@@ -133,6 +135,35 @@ export function findAiOutput(kind: AiOutputKind, personId: string, inputDigest: 
  */
 export function recentAiOutputs(limit = 200) {
   return prisma.aiOutput.findMany({ orderBy: { createdAt: "desc" }, take: limit });
+}
+
+/**
+ * What the manager says each person should be on. Read as a whole: one row per
+ * person on a team small enough to fit on a dashboard, so filtering in the
+ * database would cost a round trip to save nothing.
+ */
+export function personFocus() {
+  return prisma.personFocus.findMany({ orderBy: { personId: "asc" } });
+}
+
+/**
+ * Replaces this person's current focus. An intention that has been superseded is
+ * a stale instruction rather than history, so there is one row per person and no
+ * log behind it — unlike `ai_output`, which appends because a past judgment
+ * stays true of the window it judged.
+ */
+export async function setPersonFocus(personId: string, focus: string): Promise<void> {
+  const setAt = new Date();
+  await prisma.personFocus.upsert({
+    where: { personId },
+    create: { personId, focus, setAt },
+    update: { focus, setAt },
+  });
+}
+
+/** Clearing is not the same as setting an empty focus: the person has none again. */
+export async function clearPersonFocus(personId: string): Promise<void> {
+  await prisma.personFocus.deleteMany({ where: { personId } });
 }
 
 export async function markSynced(source: string): Promise<void> {

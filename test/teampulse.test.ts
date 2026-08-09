@@ -4,14 +4,16 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { indexPeople, loadConfig, parseSince } from "../src/config";
 import {
-  findAiOutput, markSynced, prisma, recentAiOutputs, replaceAiUsage, replaceOpenIssues,
-  saveActivities, saveAiOutput,
+  clearPersonFocus, findAiOutput, markSynced, personFocus, prisma, recentAiOutputs,
+  replaceAiUsage, replaceOpenIssues, saveActivities, saveAiOutput, setPersonFocus,
 } from "../src/db";
 import {
-  DEFAULT_BREAK_MINUTES, activityFeed, aiUsage, aiUsageDaily, bugRatio, dailyCounts, coverage, daySessions, dayMarks, hourlyCounts,
+  DEFAULT_BREAK_MINUTES, activityFeed, aiUsage, aiUsageDaily, assignments, bugRatio, dailyCounts, coverage, daySessions, dayMarks, hourlyCounts,
   intakeMix, personStats, repositories, reviewWaits, shippedMix, staleIssues, teamStats,
   lastSyncs, unclassifiedWork,
 } from "../src/metrics";
+import { focusBriefs } from "../src/focus";
+import { priorityLabel } from "../src/priority";
 import { arrivedViaPullRequest } from "../src/commitmessage";
 import {
   BUILT_IN_VIEW, clearSavedView, readSavedView, sameView, writeSavedView,
@@ -390,6 +392,121 @@ test("open issues: the snapshot is replaced wholesale, and stale ones surface", 
   // A shorter horizon widens the net.
   expect(await staleIssues(1)).toHaveLength(1);
   await prisma.openIssue.deleteMany({});
+});
+
+test("assignments: Linear's 0 means no priority, so it sorts last and not first", async () => {
+  const assigned = (id: string, priority: number, extra: Record<string, unknown> = {}) => ({
+    id,
+    identifier: `ENG-${id}`,
+    title: `issue ${id}`,
+    url: `https://linear.app/${id}`,
+    personId: "maya",
+    state: "In Progress",
+    priority,
+    updatedAt: ago(1),
+    ...extra,
+  });
+
+  await replaceOpenIssues([
+    assigned("none", 0),
+    assigned("low", 4),
+    assigned("urgent", 1, { projectName: "Billing", initiativeName: "Revenue" }),
+    { ...assigned("other", 1), personId: "sam" },
+  ]);
+
+  const mine = await assignments("maya");
+  // Urgent first, then low, and the unprioritised one last despite carrying the
+  // smallest number — this is the whole reason the query does not sort on it.
+  expect(mine.map((row) => row.identifier)).toEqual(["ENG-urgent", "ENG-low", "ENG-none"]);
+  expect(mine[0]!.project_name).toBe("Billing");
+  expect(mine[0]!.initiative_name).toBe("Revenue");
+  // A project and an initiative are both optional, and absent is null, not "".
+  expect(mine[1]!.project_name).toBeNull();
+  expect(mine[1]!.initiative_name).toBeNull();
+
+  // Unscoped covers the whole team; scoped covers one person.
+  expect(await assignments()).toHaveLength(4);
+  await prisma.openIssue.deleteMany({});
+});
+
+test("priorityLabel: names the scale, and never throws on a number from an API", () => {
+  expect(priorityLabel(0)).toBe("no priority");
+  expect(priorityLabel(1)).toBe("urgent");
+  expect(priorityLabel(4)).toBe("low");
+  // Outside the scale reads as unprioritised rather than crashing a brief.
+  expect(priorityLabel(9)).toBe("no priority");
+  expect(priorityLabel(-1)).toBe("no priority");
+});
+
+test("person focus: one current statement per person, replaced rather than logged", async () => {
+  await setPersonFocus("maya", "Ship the billing migration");
+  await setPersonFocus("sam", "Unblock the API review queue");
+
+  let stated = await personFocus();
+  expect(stated.map((row) => row.personId)).toEqual(["maya", "sam"]);
+  expect(stated[0]!.focus).toBe("Ship the billing migration");
+
+  // Setting again supersedes rather than appending: a stale instruction is not history.
+  await setPersonFocus("maya", "Pair with Sam on the API");
+  stated = await personFocus();
+  expect(stated).toHaveLength(2);
+  expect(stated[0]!.focus).toBe("Pair with Sam on the API");
+
+  // Clearing means they have none again, and touches nobody else.
+  await clearPersonFocus("maya");
+  stated = await personFocus();
+  expect(stated.map((row) => row.personId)).toEqual(["sam"]);
+
+  // Clearing somebody who never had one is not an error.
+  await clearPersonFocus("nobody");
+  await prisma.personFocus.deleteMany({});
+});
+
+const person = (id: string, name: string) => ({
+  id,
+  name,
+  githubLogins: [],
+  workWeek: "sunday-thursday" as const,
+});
+
+test("focusBriefs: three lists per person, and an absent focus stays absent", async () => {
+  await setPersonFocus("maya", "Ship the billing migration");
+  await replaceOpenIssues([
+    {
+      id: "1",
+      identifier: "ENG-1",
+      title: "Billing migration",
+      url: "https://linear.app/1",
+      personId: "maya",
+      state: "In Progress",
+      priority: 1,
+      updatedAt: ago(1),
+    },
+  ]);
+  await saveActivities([
+    { id: "f1", source: "github", type: "pr_merged", personId: "maya", ts: ago(1), title: "Migrate billing" },
+    { id: "f2", source: "github", type: "pr_merged", personId: "sam", ts: ago(1), title: "Something else" },
+  ]);
+
+  const briefs = await focusBriefs({
+    people: [person("maya", "Maya"), person("sam", "Sam")],
+    since: SINCE,
+  });
+
+  const maya = briefs.find((brief) => brief.personId === "maya")!;
+  expect(maya.declared?.focus).toBe("Ship the billing migration");
+  expect(maya.assignments.map((row) => row.identifier)).toEqual(["ENG-1"]);
+  expect(maya.events.map((row) => row.id)).toEqual(["f1"]);
+
+  // Nobody stated anything about Sam, and he is assigned nothing. That is a real
+  // answer — he still gets a brief, with the absence visible rather than filled in.
+  const sam = briefs.find((brief) => brief.personId === "sam")!;
+  expect(sam.declared).toBeNull();
+  expect(sam.assignments).toEqual([]);
+  expect(sam.events.map((row) => row.id)).toEqual(["f2"]);
+
+  await prisma.openIssue.deleteMany({});
+  await prisma.personFocus.deleteMany({});
 });
 
 test("markSynced: records the run, then updates it in place", async () => {

@@ -3,9 +3,10 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { indexPeople, loadConfig, parseSince } from "./config";
 import { prisma } from "./db";
+import { focusBriefs } from "./focus";
 import { storedJudgments } from "./judgment";
 import {
-  DEFAULT_BREAK_MINUTES, activityFeed, aiUsage, bugRatio, coverage, dailyCounts,
+  DEFAULT_BREAK_MINUTES, activityFeed, aiUsage, assignments, bugRatio, coverage, dailyCounts,
   daySessions, dayMarks, hourlyCounts, intakeMix, lastSyncs, personStats,
   repositories, reviewWaits, shippedMix, staleIssues, teamStats,
 } from "./metrics";
@@ -246,8 +247,10 @@ server.registerTool(
     description:
       "The AI layer's stored opinions — the newest of each kind per person, from ai_output. This is " +
       "the one tool here whose answers are not facts: a 'summary' is a model's reading of somebody's " +
-      "window, and a 'work_type' proposal is a guess at what unclassified merged PRs and created " +
-      "issues were. Proposals are never written back to activity, so shipped_mix and intake_mix keep " +
+      "window, a 'work_type' proposal is a guess at what unclassified merged PRs and created " +
+      "issues were, and a 'focus' reading is an opinion on how somebody's window lines up with the " +
+      "priorities daily_focus lists — an opinion about two lists, never a grade of the person. " +
+      "Proposals are never written back to activity, so shipped_mix and intake_mix keep " +
       "reporting those items as unclassified — do not add these to a count or reconcile them against " +
       "one. Each row carries the window it judged, which may be narrower or older than the one you " +
       "are asking about, and the run that produced it. Nothing here can be produced by a model: only " +
@@ -255,6 +258,60 @@ server.registerTool(
     annotations: { readOnlyHint: true },
   },
   async () => asJson(await storedJudgments()),
+);
+
+server.registerTool(
+  "assignments",
+  {
+    description:
+      "Every open Linear assignment per person, most important first: priority, state, the project " +
+      "and initiative it rolls up to, and how many days since anything touched it. Priority is " +
+      "Linear's own scale and is not an ordering — 0 means 'no priority', 1 is urgent through 4 " +
+      "low — so the rows arrive sorted and the numbers should not be re-sorted on. Reads the " +
+      "open_issue snapshot, which is only as fresh as the last Linear sync.",
+    inputSchema: {
+      person_id: z
+        .string()
+        .optional()
+        .describe("Canonical id from the people tool. Omit for the whole team."),
+    },
+    annotations: { readOnlyHint: true },
+  },
+  async ({ person_id }) => {
+    if (person_id !== undefined && !people.byId.has(person_id)) {
+      throw new Error(`unknown person_id "${person_id}" — call the people tool for the valid ids`);
+    }
+    return asJson(await assignments(person_id));
+  },
+);
+
+server.registerTool(
+  "daily_focus",
+  {
+    description:
+      "The focus brief per person: what their manager stated they should be on, what Linear has " +
+      "them assigned to, and every event they produced in the window — the three lists a reader " +
+      "needs side by side to ask whether somebody is on the right thing. " +
+      "The stated focus is neither measured nor inferred: it is text a manager typed, it is null " +
+      "for anybody nobody has stated one for, and it outranks the tracker when the two disagree. " +
+      "Events are instants, so silence against a priority means the work left no trace, never " +
+      "that it did not happen — do not read effort, hours or diligence out of this. " +
+      "This tool reports the lists; it does not judge how they line up. That reading costs money " +
+      "and only a person can spend it, from the dashboard — read it back with the judgments tool.",
+    inputSchema: {
+      ...windowInput,
+      since: z.string().default("1d").describe(SINCE_DESCRIPTION),
+    },
+    annotations: { readOnlyHint: true },
+  },
+  async ({ since, repository }) =>
+    asJson(
+      await focusBriefs({
+        people: configuration.people,
+        since: parseSince(since),
+        repository,
+      }),
+    ),
 );
 
 registerWindowedTool(
