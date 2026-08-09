@@ -2,7 +2,9 @@ import { anthropic } from "@ai-sdk/anthropic";
 import { generateObject } from "ai";
 import { z } from "zod";
 import { type AiOutputKind, findAiOutput, recentAiOutputs, saveAiOutput } from "./db";
+import type { FocusBrief } from "./focus";
 import { activityFeed, unclassifiedWork } from "./metrics";
+import { priorityLabel } from "./priority";
 import { WORK_TYPES } from "./worktype";
 
 /**
@@ -77,12 +79,59 @@ const WORK_TYPE_SCHEMA = z.object({
     ),
 });
 
+const FOCUS_SCHEMA = z.object({
+  alignment: z
+    .enum(["on_priorities", "mixed", "off_priorities", "not_enough_signal"])
+    .describe(
+      "How the window's events line up with the priorities stated above them. " +
+        "not_enough_signal whenever there is no stated priority to compare against, or too " +
+        "little activity to say — it is the honest answer far more often than it looks, and " +
+        "it is always better than a verdict built out of two events.",
+    ),
+  workingOn: z
+    .string()
+    .describe(
+      "One sentence on what the events show them working on. Describe the work, not the person.",
+    ),
+  matched: z
+    .array(
+      z.object({
+        priority: z.string().describe("The stated priority, copied closely enough to be recognised."),
+        evidence: z.string().describe("The events that show work on it, named as the list names them."),
+      }),
+    )
+    .describe("Stated priorities the events show visible work on."),
+  untouched: z
+    .array(z.string().describe("A stated priority with nothing visible against it in this window."))
+    .describe(
+      "Stated priorities the events say nothing about. This means the work left no trace, " +
+        "which is not the same as it not happening — reading code, thinking and pairing all " +
+        "emit nothing at all.",
+    ),
+  unexplained: z
+    .array(z.string().describe("Work visible in the events that no stated priority accounts for."))
+    .describe(
+      "Activity that maps to none of the priorities. An empty list is a fine answer. Do not " +
+        "count review, unblocking a teammate or answering a question as unexplained by default — " +
+        "say what it was and let the reader judge whether it belonged.",
+    ),
+  ask: z
+    .string()
+    .nullable()
+    .describe(
+      "The single question worth putting to this person, in their manager's own plain words, " +
+        "or null when the window raises none. One question, not a list, and never a reprimand.",
+    ),
+});
+
 export type PersonSummary = z.infer<typeof SUMMARY_SCHEMA>;
 export type WorkTypeProposals = z.infer<typeof WORK_TYPE_SCHEMA>;
+export type FocusReading = z.infer<typeof FOCUS_SCHEMA>;
 
 export type Judgment =
   | { kind: "summary"; personId: string; cached: boolean; payload: PersonSummary }
   | { kind: "work_type"; personId: string; cached: boolean; payload: WorkTypeProposals }
+  | { kind: "focus"; personId: string; cached: boolean; payload: FocusReading }
   | { kind: AiOutputKind; personId: string; error: string };
 
 /** A stored judgment, read back and re-validated. Carries the window it judged, not the current one. */
@@ -91,7 +140,18 @@ export type StoredJudgment = {
   windowStart: Date;
   windowEnd: Date;
   createdAt: Date;
-} & ({ kind: "summary"; payload: PersonSummary } | { kind: "work_type"; payload: WorkTypeProposals });
+} & (
+  | { kind: "summary"; payload: PersonSummary }
+  | { kind: "work_type"; payload: WorkTypeProposals }
+  | { kind: "focus"; payload: FocusReading }
+);
+
+/** Every kind that has a schema here, paired with it, so reading one back is one lookup. */
+const SCHEMAS = {
+  summary: SUMMARY_SCHEMA,
+  work_type: WORK_TYPE_SCHEMA,
+  focus: FOCUS_SCHEMA,
+} as const;
 
 /**
  * The newest judgment of each kind per person, whatever window it was made over
@@ -105,8 +165,9 @@ export async function storedJudgments(): Promise<StoredJudgment[]> {
   const judgments: StoredJudgment[] = [];
 
   for (const row of rows) {
-    if (row.kind !== "summary" && row.kind !== "work_type") continue;
-    const key = `${row.kind}:${row.personId}`;
+    const kind = row.kind;
+    if (!(kind in SCHEMAS)) continue;
+    const key = `${kind}:${row.personId}`;
     if (seen.has(key)) continue;
     seen.add(key);
 
@@ -117,14 +178,12 @@ export async function storedJudgments(): Promise<StoredJudgment[]> {
       createdAt: row.createdAt,
     };
 
-    if (row.kind === "summary") {
-      const parsed = SUMMARY_SCHEMA.safeParse(row.payload);
-      if (parsed.success) judgments.push({ ...stored, kind: "summary", payload: parsed.data });
-      continue;
-    }
-
-    const parsed = WORK_TYPE_SCHEMA.safeParse(row.payload);
-    if (parsed.success) judgments.push({ ...stored, kind: "work_type", payload: parsed.data });
+    const parsed = SCHEMAS[kind as keyof typeof SCHEMAS].safeParse(row.payload);
+    if (!parsed.success) continue;
+    // The cast holds because SCHEMAS pairs each kind with the one schema that
+    // just validated this payload: `kind` and `payload` cannot disagree here.
+    // TypeScript loses that pairing across the index, not the program.
+    judgments.push({ ...stored, kind, payload: parsed.data } as StoredJudgment);
   }
 
   return judgments;
@@ -142,6 +201,25 @@ const WORK_TYPE_INSTRUCTIONS = [
   "label or a conventional-commit prefix saying what kind of work it was, which is why it is",
   "here. Judge only from the title and body given. When they are ambiguous, leave the item",
   "out: an unclassified item is reported as a visible gap, and a wrong ratio is worse than a gap.",
+].join(" ");
+
+const FOCUS_INSTRUCTIONS = [
+  "You are given one person's stated priorities and the events their work produced in a window,",
+  "and you say how the two line up. You are answering for their manager.",
+  "",
+  "The priorities come from three places and they are not equal: a manager's stated focus is an",
+  "instruction and outranks the tracker, a Linear issue's own priority is what the tracker",
+  "records, and a project or initiative says which larger thing a piece of work belongs to.",
+  "When the manager's focus and the tracker disagree, say so — that disagreement is the single",
+  "most useful thing on the page, and it is a fact about the two lists, not a fault of the person.",
+  "",
+  "Hard limits. Events are instants, not durations: they are the moments work surfaced, so you",
+  "cannot tell effort, hours or diligence from them, and you must never try. Silence against a",
+  "priority means it left no trace — reading code, thinking, pairing and meetings people did not",
+  "book all look identical to a quiet day. Never grade, rank, praise or reprimand the person, and",
+  "never compare them to anybody else; there is nobody else in this prompt for that reason.",
+  "Judge only the fit between two lists you were handed, and when the lists are too thin to",
+  "support a verdict, answer not_enough_signal and stop.",
 ].join(" ");
 
 function digestOf(prompt: string): string {
@@ -168,6 +246,44 @@ export function workTypePrompt(
       ].join("\n"),
     )
     .join("\n\n");
+}
+
+/**
+ * The three lists, in the order they carry weight: what a manager said, what the
+ * tracker holds, and what actually surfaced. Laid out as labelled sections rather
+ * than prose so the model is never left guessing which list a line came from.
+ */
+export function focusPrompt(brief: FocusBrief): string {
+  const declared = brief.declared
+    ? `${brief.declared.focus}\n(set ${brief.declared.setAt})`
+    : "none stated";
+
+  const assignments = brief.assignments.length
+    ? brief.assignments
+        .map((issue) =>
+          [
+            `${issue.identifier} ${issue.title}`,
+            `  priority: ${priorityLabel(issue.priority)}`,
+            `  state: ${issue.state}`,
+            `  project: ${issue.project_name ?? "none"}`,
+            `  initiative: ${issue.initiative_name ?? "none"}`,
+            `  untouched for: ${issue.idle_days} days`,
+          ].join("\n"),
+        )
+        .join("\n")
+    : "none open";
+
+  const events = brief.events.length
+    ? brief.events
+        .map((row) => `${row.ts.toISOString()} ${row.type} ${row.title ?? ""}`.trimEnd())
+        .join("\n")
+    : "none in this window";
+
+  return [
+    `# Focus stated by their manager\n${declared}`,
+    `# Open assignments in Linear, most important first\n${assignments}`,
+    `# Events in this window, newest first\n${events}`,
+  ].join("\n\n");
 }
 
 async function ask<T>(input: {
@@ -229,6 +345,45 @@ export async function judge(options: {
         items: unclassified.filter((item) => item.person_id === personId),
       }),
     ]),
+  );
+
+  return results.filter((judgment): judgment is Judgment => judgment !== null);
+}
+
+/**
+ * Reads each person's focus brief and says how their window lines up with what
+ * they were asked to be on. Separate from `judge` because it answers a different
+ * question over a different window — a day, against priorities that were true
+ * this morning — and because a manager should be able to spend one without
+ * paying for the other.
+ */
+export async function judgeFocus(options: {
+  briefs: FocusBrief[];
+  since: Date;
+}): Promise<Judgment[]> {
+  const until = new Date();
+
+  const results = await Promise.all(
+    options.briefs.map(async (brief): Promise<Judgment | null> => {
+      // Nothing stated and nothing open: there is no pair of lists to compare, so
+      // the only honest reading is one this function can give away for free.
+      if (!brief.declared && !brief.assignments.length) return null;
+
+      try {
+        const { payload, cached } = await ask({
+          kind: "focus",
+          personId: brief.personId,
+          since: options.since,
+          until,
+          instructions: FOCUS_INSTRUCTIONS,
+          prompt: focusPrompt(brief),
+          schema: FOCUS_SCHEMA,
+        });
+        return { kind: "focus", personId: brief.personId, cached, payload };
+      } catch (error) {
+        return { kind: "focus", personId: brief.personId, error: String(error) };
+      }
+    }),
   );
 
   return results.filter((judgment): judgment is Judgment => judgment !== null);
