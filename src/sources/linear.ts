@@ -79,10 +79,41 @@ const OPEN = `
         id identifier title url updatedAt priority
         assignee { id }
         state { name }
+        project { id name }
         labels { nodes { name } }
       }
     }
   }`;
+
+/**
+ * Initiatives are asked for separately rather than through `project.initiatives`
+ * because they are a paid-plan feature: on a workspace without them the field
+ * does not resolve, and folding it into the query above would cost the whole
+ * open-issue snapshot rather than one optional column. Its failure is swallowed
+ * for the same reason — an issue with no initiative and a workspace with no
+ * initiatives are the same absence downstream.
+ */
+const INITIATIVES = `
+  query Initiatives($after: String) {
+    initiatives(first: 100, after: $after) {
+      pageInfo { hasNextPage endCursor }
+      nodes { id name projects { nodes { id } } }
+    }
+  }`;
+
+async function initiativeByProject(): Promise<Map<string, string>> {
+  const byProject = new Map<string, string>();
+  try {
+    for (const initiative of await paginate<any>(INITIATIVES, {}, "initiatives")) {
+      for (const project of initiative.projects?.nodes ?? []) {
+        byProject.set(project.id, initiative.name);
+      }
+    }
+  } catch {
+    // Left empty on purpose: see the comment on INITIATIVES.
+  }
+  return byProject;
+}
 
 const labelsOf = (n: any): string[] => (n.labels?.nodes ?? []).map((l: any) => l.name);
 
@@ -132,6 +163,7 @@ export async function collectLinear(people: People, since: Date): Promise<Activi
 }
 
 export async function collectOpenIssues(people: People): Promise<OpenIssue[]> {
+  const initiatives = await initiativeByProject();
   const out: OpenIssue[] = [];
   for (const i of await paginate<any>(OPEN, {}, "issues")) {
     const personId = i.assignee?.id && people.byLinear.get(i.assignee.id);
@@ -145,6 +177,8 @@ export async function collectOpenIssues(people: People): Promise<OpenIssue[]> {
       state: i.state?.name ?? "",
       workType: classify(i.title, labelsOf(i)),
       priority: i.priority ?? 0,
+      projectName: i.project?.name ?? null,
+      initiativeName: (i.project?.id && initiatives.get(i.project.id)) ?? null,
       updatedAt: i.updatedAt,
     });
   }

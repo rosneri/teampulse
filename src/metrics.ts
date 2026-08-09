@@ -508,6 +508,41 @@ export function aiUsageDaily(since: Date) {
     order by 1, 2`;
 }
 
+export type Assignment = {
+  person_id: string;
+  identifier: string;
+  title: string;
+  url: string;
+  state: string;
+  work_type: string | null;
+  /** Linear's scale: 0 is "no priority", then 1 urgent through 4 low. */
+  priority: number;
+  project_name: string | null;
+  initiative_name: string | null;
+  idle_days: number;
+};
+
+/**
+ * Every open assignment, most important first — what each person is currently on
+ * the hook for, as their tracker records it.
+ *
+ * Reads the same `open_issue` snapshot as `staleIssues`, which the last Linear
+ * sync replaced wholesale, so it is current as of that sync and no fresher.
+ */
+export function assignments(personId?: string) {
+  const person = personId ? Prisma.sql`where person_id = ${personId}` : Prisma.empty;
+  return prisma.$queryRaw<Assignment[]>`
+    select person_id, identifier, title, url, state, work_type, priority,
+      project_name, initiative_name,
+      extract(day from (now() - updated_at))::int as idle_days
+    from open_issue
+    ${person}
+    -- Linear writes 0 for "no priority", so ordering by the number alone would
+    -- rank unprioritised work above Urgent. 0 sorts last, 1..4 ascending, and
+    -- the longest-untouched breaks a tie.
+    order by person_id, (priority = 0), priority, updated_at asc`;
+}
+
 /** Open assignments nobody has touched in a while. */
 export function staleIssues(days = 14) {
   return prisma.$queryRaw<

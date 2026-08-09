@@ -67,6 +67,14 @@ export type OpenIssue = {
   personId: string;
   state: string;
   workType?: WorkType | null;
+  /**
+   * Linear's own scale, and it is not an ordering: 0 means "no priority", then
+   * 1 urgent through 4 low. Anything sorting by this number has to put 0 last
+   * rather than first.
+   */
   priority: number;
+  /** The project this rolls up to, and that project's initiative. Null when it belongs to neither. */
+  projectName?: string | null;
+  initiativeName?: string | null;
   updatedAt: string;
 };

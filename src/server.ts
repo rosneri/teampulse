@@ -1,5 +1,7 @@
 import { indexPeople, loadConfig, parseSince } from "./config";
-import { judge, storedJudgments } from "./judgment";
+import { clearPersonFocus, setPersonFocus } from "./db";
+import { focusBriefs } from "./focus";
+import { judge, judgeFocus, storedJudgments } from "./judgment";
 import {
   DEFAULT_BREAK_MINUTES, activityFeed, aiUsage, bugRatio, coverage, dailyCounts,
   daySessions, dayMarks, hourlyCounts, intakeMix, lastSyncs, personStats,
@@ -16,10 +18,13 @@ import index from "./ui/index.html";
 const configuration = await loadConfig();
 const people = indexPeople(configuration);
 
-/** `?since=` is user input: a bad value is a 400, never a 500. */
-function windowOf(url: string): Date | null {
+/**
+ * `?since=` is user input: a bad value is a 400, never a 500. The fallback is
+ * per-endpoint — the dashboard asks about a month, the focus brief about a day.
+ */
+function windowOf(url: string, fallback = "30d"): Date | null {
   try {
-    return parseSince(new URL(url).searchParams.get("since") ?? "30d");
+    return parseSince(new URL(url).searchParams.get("since") ?? fallback);
   } catch {
     return null;
   }
@@ -178,6 +183,86 @@ const server = Bun.serve({
           since,
           repository: repositoryOf(req.url),
         });
+        return Response.json({ since: since.toISOString(), judgments });
+      },
+    },
+
+    /**
+     * The daily focus brief, one entry per person: what a manager said they
+     * should be on, what Linear has them assigned to, what actually surfaced in
+     * the window, and the last stored reading of how those line up.
+     *
+     * Its own window, defaulting to a day, because "are they on the right thing"
+     * is a question about today and the dashboard above opens on thirty.
+     */
+    "/api/focus": async (req) => {
+      const since = windowOf(req.url, "1d");
+      if (!since) return bad("bad ?since — use 1d, 7d, or a date");
+
+      const repository = repositoryOf(req.url);
+      const [briefs, judgments] = await Promise.all([
+        focusBriefs({ people: configuration.people, since, repository }),
+        storedJudgments(),
+      ]);
+
+      return Response.json({
+        since: since.toISOString(),
+        repository: repository ?? null,
+        briefs,
+        // Read only: a reading is produced by POST /api/judge/focus, never by
+        // loading the page — this is the endpoint that costs nothing.
+        judgments: judgments.filter((judgment) => judgment.kind === "focus"),
+      });
+    },
+
+    /**
+     * Setting and clearing what a person should be on. The one endpoint here
+     * that stores something a human typed rather than something a collector
+     * found, and the only writer of `person_focus`.
+     *
+     * State-changing and unauthenticated, like every other write on this server:
+     * it binds localhost and needs an auth layer before it goes anywhere else.
+     */
+    "/api/focus/:id": {
+      POST: async (req) => {
+        if (!people.byId.has(req.params.id)) return bad("unknown person", 404);
+
+        // A request body is a trust boundary: checked once here, believed after.
+        const body: unknown = await req.json().catch(() => null);
+        const focus =
+          body && typeof body === "object" && "focus" in body && typeof body.focus === "string"
+            ? body.focus.trim()
+            : null;
+        if (!focus) return bad('body must be {"focus": "…"} with a non-empty string');
+
+        await setPersonFocus(req.params.id, focus);
+        return Response.json({ personId: req.params.id, focus });
+      },
+
+      DELETE: async (req) => {
+        if (!people.byId.has(req.params.id)) return bad("unknown person", 404);
+        await clearPersonFocus(req.params.id);
+        return Response.json({ personId: req.params.id, focus: null });
+      },
+    },
+
+    /**
+     * Asks the model how each person's window lines up with their priorities.
+     * Sits under /api/judge rather than /api/focus so it can never be mistaken
+     * for a person id by the route above, and because it belongs to the layer
+     * that spends money — like /api/judge, only a person's click runs it.
+     */
+    "/api/judge/focus": {
+      POST: async (req) => {
+        const since = windowOf(req.url, "1d");
+        if (!since) return bad("bad ?since — use 1d, 7d, or a date");
+
+        const briefs = await focusBriefs({
+          people: configuration.people,
+          since,
+          repository: repositoryOf(req.url),
+        });
+        const judgments = await judgeFocus({ briefs, since });
         return Response.json({ since: since.toISOString(), judgments });
       },
     },
