@@ -12,6 +12,12 @@ Two layers, kept strictly apart:
   Anthropic API through the Vercel AI SDK, against a Zod schema that describes
   each field it is allowed to fill in — see `src/judgment.ts`.
 
+There is one row that is neither, and it lives in `person_focus`: what a manager
+says somebody should be on. Not collected from a source and not a model's
+opinion — an intention, typed by a person. It is the only thing in this database
+a human writes directly, and the focus card is what compares it against the
+other two.
+
 ## Setup
 
 ```bash
@@ -118,6 +124,33 @@ Everything happens there:
 - **Claude Code** shows tokens, cost, sessions and accepted edits per person from
   Anthropic's usage report. It is reported by whole day, so it carries no time of
   day and deliberately never reaches the two charts above.
+- **Daily focus** answers the one question the rest of the page does not: is each
+  person on the right thing *today*. It has its own window — today, three days,
+  or the week — because everything below it opens on a month.
+
+  Three lists sit side by side per person, and they do not carry equal weight:
+
+  1. **Stated focus** — what you typed into the field. It is neither collected
+     nor inferred, it is an instruction, and it outranks the tracker when the
+     two disagree. It saves on the button only: a half-typed sentence is not an
+     instruction, and a field that saved as you thought would make it one.
+  2. **Assigned in Linear** — their open issues, most important first. Linear's
+     priority is a set of names and not an ordering — `0` is *no priority*, then
+     1 urgent through 4 low — so the rows arrive sorted and the number is never
+     sorted on again.
+  3. **What surfaced** — their events in the window.
+
+  **Check focus** is the second button here that spends money. It asks a model
+  how the three lines up and appends the reading to `ai_output`, never to
+  `activity`. It reports what it cannot see as loudly as what it can: a priority
+  with no events against it means *the work left no trace* — reading code,
+  thinking and pairing all emit nothing — and it answers **not enough signal**
+  rather than inventing a verdict out of two events. It reads one person against
+  their own priorities and nobody else's; there is no second person in the prompt.
+
+  Someone with nothing stated and nothing assigned is not judged at all, and
+  costs nothing: there is no pair of lists to compare.
+
 - **Judgment** is the one card on the page no number comes from. **Run judgment**
   asks a model two questions about each person — what their window was about, and
   what kind of work the unclassified merged PRs and created issues were — and
@@ -134,10 +167,21 @@ Everything happens there:
 - **Selecting a person** opens their stats and their last 40 events.
 
 `PORT` overrides the port. The server binds localhost and has no authentication;
-`POST /api/sync` and `POST /api/judge` change state, so they need an auth layer
-before either is ever exposed beyond the machine it runs on.
+`POST /api/sync`, `POST /api/judge`, `POST /api/judge/focus` and
+`POST|DELETE /api/focus/:id` change state, so they need an auth layer before any
+of them is ever exposed beyond the machine it runs on.
 
 There is no command line interface. `src/server.ts` is the entry point.
+
+### The daily review
+
+`/daily-focus` (in `.claude/commands/`) is the interactive version of the focus
+card, for walking the team one person at a time rather than reading a page. It
+runs in two stages with you in the middle: it prints one table and stops, and
+only on your go-ahead does it turn each person into a concrete choice, apply the
+answers, and draft the messages. It reads through the MCP server below and
+writes only what you chose, through `POST /api/focus/:id` — so `bun run ui` has
+to be running for that step.
 
 ## What's measured
 
@@ -219,7 +263,11 @@ different from a quiet week. The known limits, per source:
   per query, so a very wide window silently loses the tail). A commit whose
   author GitHub cannot resolve to a login belongs to nobody.
 - **Linear** — issues created and completed, and comments. State changes,
-  assignment changes, estimates and project updates are not events here.
+  assignment changes, estimates and project updates are not events here. The
+  open-assignment snapshot also carries each issue's project and the initiative
+  that project belongs to; initiatives are a paid-plan feature, so on a workspace
+  without them that column is simply null and the sync does not fail. "No
+  initiative" and "this workspace has no initiatives" are the same absence here.
 - **Slack** — the hard ceiling: a user token only reaches conversations *you*
   are in. Anything a teammate says in a channel you never joined, or in a DM
   with someone else, is invisible and always will be. Reactions, file uploads
@@ -247,9 +295,11 @@ empty rather than wrong.
 ## Layout
 
 ```
-prisma/schema.prisma   activity, open_issue, ai_output, sync_run
+prisma/schema.prisma   activity, open_issue, person_focus, ai_output, sync_run
 src/types.ts           the Activity shape every source collapses into
 src/worktype.ts        deterministic bug/feature/improvement/chore classifier
+src/priority.ts        Linear's priority scale, which is names and not an ordering
+src/focus.ts           the daily brief: stated focus, assignments, what surfaced
 src/judgment.ts        the AI layer: Zod schemas, prompts, writes to ai_output
 src/commitmessage.ts   whether a commit already arrived through a merged PR
 src/workweek.ts        which days a person works, and so which are their weekend
@@ -279,16 +329,24 @@ connection. `.mcp.json` registers it for MCP clients that read one:
 
 Tools: `people`, `team_stats`, `person_stats`, `review_waits`, `shipped_mix`,
 `intake_mix`, `bug_ratio`, `daily_counts`, `hourly_counts`, `day_sessions`,
-`day_marks`, `coverage`, `ai_usage`, `judgments`, `stale_issues`, `activity`.
+`day_marks`, `coverage`, `ai_usage`, `judgments`, `stale_issues`, `assignments`,
+`daily_focus`, `activity`.
+
+`daily_focus` returns the three lists the focus card shows and deliberately does
+not judge them: the reading costs money, and only a person can spend it. Its
+stated focus is the one value in the whole MCP surface that nobody measured —
+it is text a manager typed, and it is null for anybody nobody has typed one for.
 
 `judgments` is the one tool whose answers are not facts: it reads back what the
 AI layer stored, and its own description says so, so a model reading it knows not
 to add a proposed work type to a count that deliberately excludes it.
 
-It is **read-only on purpose**. There is no sync tool: pulling from GitHub,
-Linear and Slack is a person's decision, and the UI is where it is made. Every
-number a model sees comes from the SQL in `src/metrics.ts`, so the model and the
-dashboard can never disagree.
+It is **read-only on purpose**. There is no sync tool and no way to set a focus:
+pulling from GitHub, Linear and Slack is a person's decision, and so is saying
+what somebody should be working on. The UI is where both are made — the
+`/daily-focus` command writes a focus through `POST /api/focus/:id`, and only
+one you picked out of an answer. Every number a model sees comes from the SQL in
+`src/metrics.ts`, so the model and the dashboard can never disagree.
 
 ## Checks
 

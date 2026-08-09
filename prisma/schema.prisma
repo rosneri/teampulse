@@ -41,11 +41,33 @@ model OpenIssue {
   state      String
   workType   String?  @map("work_type")
   priority   Int      @default(0)
+  /// The Linear project this issue rolls up to, and the initiative that project
+  /// belongs to. Both null when the issue sits under neither, and the initiative
+  /// is also null when the workspace's plan does not expose initiatives at all —
+  /// "no initiative" and "initiatives unavailable" are the same absence here.
+  projectName    String? @map("project_name")
+  initiativeName String? @map("initiative_name")
   updatedAt  DateTime @map("updated_at") @db.Timestamptz(3)
   syncedAt   DateTime @default(now()) @map("synced_at") @db.Timestamptz(3)
 
   @@index([personId])
   @@map("open_issue")
+}
+
+/// What a manager says a person should be on right now.
+///
+/// The third kind of row in this database, and deliberately not either of the
+/// other two: it is not a fact collected from a source, and it is not a model's
+/// opinion. It is an intention, typed by a person, and it is what the focus
+/// brief compares observed activity against. One current statement per person —
+/// an intention that has been superseded is not history worth keeping, it is
+/// just a stale instruction.
+model PersonFocus {
+  personId String   @id @map("person_id")
+  focus    String
+  setAt    DateTime @default(now()) @map("set_at") @db.Timestamptz(3)
+
+  @@map("person_focus")
 }
 
 /// Judgment, kept strictly apart from facts. Written by the AI layer only.

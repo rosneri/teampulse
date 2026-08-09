@@ -19,6 +19,7 @@ import { type ReactNode, useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 import type { BugRatio, Bucket, PersonStats, ReviewWait, TeamStats } from "../metrics";
 import { ACTIVITY_KINDS, kindOf } from "../activitykind";
+import { priorityLabel } from "../priority";
 import { WORK_WEEK_LABELS, type WorkWeek, isWeekend, weekendDays } from "../workweek";
 import {
   ActivityChart, type DailyRow, DayShape, type DaySpan, HOURS_IN_DAY, HoursHeatmap,
@@ -111,7 +112,52 @@ type StoredJudgment = {
         }[];
       };
     }
+  | { kind: "focus"; payload: FocusReading }
 );
+
+/** One person's three lists, as GET /api/focus returns them. */
+type FocusBrief = {
+  personId: string;
+  name: string;
+  declared: { focus: string; setAt: string } | null;
+  assignments: {
+    identifier: string;
+    title: string;
+    url: string;
+    state: string;
+    priority: number;
+    project_name: string | null;
+    initiative_name: string | null;
+    idle_days: number;
+  }[];
+  events: { id: string; type: string; ts: string; title: string | null }[];
+};
+
+type FocusReading = {
+  alignment: "on_priorities" | "mixed" | "off_priorities" | "not_enough_signal";
+  workingOn: string;
+  matched: { priority: string; evidence: string }[];
+  untouched: string[];
+  unexplained: string[];
+  ask: string | null;
+};
+
+/** The focus rows of `ai_output`, which is all GET /api/focus returns of them. */
+type StoredFocusReading = {
+  personId: string;
+  windowStart: string;
+  windowEnd: string;
+  createdAt: string;
+  kind: "focus";
+  payload: FocusReading;
+};
+
+type FocusPayload = {
+  since: string;
+  repository: string | null;
+  briefs: FocusBrief[];
+  judgments: StoredFocusReading[];
+};
 
 type DayMarkRow = {
   person_id: string;
@@ -1318,6 +1364,344 @@ function StaleIssuesTable({ issues }: { issues: StaleIssue[] }) {
   );
 }
 
+/* --------------------------------------------------------------------- focus */
+
+/**
+ * Semantic, not categorical: these say how a reading came out, so they take the
+ * status colours rather than a series slot. "Not enough signal" is deliberately
+ * the neutral grey — it is an absence of evidence, not a middling result.
+ */
+const ALIGNMENT: Record<FocusReading["alignment"], { label: string; color: string }> = {
+  on_priorities: { label: "On priorities", color: "var(--good)" },
+  mixed: { label: "Mixed", color: "var(--warning)" },
+  off_priorities: { label: "Off priorities", color: "var(--critical)" },
+  not_enough_signal: { label: "Not enough signal", color: "var(--series-none)" },
+};
+
+/** How much of a day this card asks about. A Monday after a weekend wants more than one. */
+const FOCUS_RANGES = [
+  { value: "1d", label: "Today" },
+  { value: "3d", label: "3 days" },
+  { value: "7d", label: "This week" },
+];
+
+const ASSIGNMENTS_SHOWN = 4;
+
+/**
+ * The one field on this dashboard holding something a person typed rather than
+ * something a collector found. It is saved only on the button: a half-typed
+ * sentence is not an instruction, and a field that saved as you thought would
+ * make it one.
+ */
+function FocusStatement({
+  brief,
+  onSaved,
+}: {
+  brief: FocusBrief;
+  onSaved: () => void;
+}) {
+  const stated = brief.declared?.focus ?? "";
+  const [draft, setDraft] = useState(stated);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // Follows the stored statement whenever it actually changes — after a save, or
+  // after somebody else set one. A refetch that returns the same text does not
+  // re-run this, so an unsaved edit survives every reload but a real change.
+  useEffect(() => {
+    setDraft(stated);
+  }, [stated]);
+
+  const changed = draft.trim() !== stated;
+
+  async function write(method: "POST" | "DELETE") {
+    setSaving(true);
+    setError(null);
+    try {
+      const response = await fetch(`/api/focus/${encodeURIComponent(brief.personId)}`, {
+        method,
+        headers: { "content-type": "application/json" },
+        body: method === "POST" ? JSON.stringify({ focus: draft.trim() }) : undefined,
+      });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload?.error ?? response.statusText);
+      onSaved();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="mt-2">
+      <div className="flex flex-wrap items-center gap-2">
+        <input
+          type="text"
+          value={draft}
+          onChange={(event) => setDraft(event.target.value)}
+          placeholder="What should they be on this week?"
+          aria-label={`Focus for ${brief.name}`}
+          className="min-w-0 flex-1 rounded-lg border border-hairline bg-plane px-3 py-2 text-sm text-ink-primary placeholder:text-ink-muted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--series-1)]"
+        />
+        <button
+          type="button"
+          disabled={saving || !changed || !draft.trim()}
+          onClick={() => write("POST")}
+          className="cursor-pointer rounded-full border border-hairline bg-surface px-3 py-2 text-xs text-ink-primary hover:border-[var(--series-1)] disabled:cursor-default disabled:text-ink-muted disabled:hover:border-hairline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--series-1)]"
+        >
+          {saving ? "Saving…" : "Set focus"}
+        </button>
+        {brief.declared ? (
+          <button
+            type="button"
+            disabled={saving}
+            onClick={() => write("DELETE")}
+            className="cursor-pointer text-xs text-ink-secondary underline decoration-hairline underline-offset-4 hover:text-ink-primary focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--series-1)]"
+          >
+            Clear
+          </button>
+        ) : null}
+      </div>
+
+      {error ? <p className="mt-1 text-xs text-critical">{error}</p> : null}
+
+      <p className="mt-1 text-xs text-ink-muted">
+        {brief.declared
+          ? `Stated ${formatTimestamp(brief.declared.setAt)}. This outranks the tracker when the two disagree.`
+          : "Nothing stated. Their Linear priorities below are all this card has to compare against."}
+      </p>
+    </div>
+  );
+}
+
+/**
+ * The second thing on this page that spends money. Separate from Run judgment
+ * because it asks a different question over a different window, and a manager
+ * should be able to pay for one without the other.
+ */
+function FocusCheckButton({ range, onFinished }: { range: string; onFinished: () => void }) {
+  const [running, setRunning] = useState(false);
+  const [failures, setFailures] = useState<JudgeResult[]>([]);
+  const [error, setError] = useState<string | null>(null);
+
+  async function runCheck() {
+    setRunning(true);
+    setError(null);
+    try {
+      const response = await fetch(`/api/judge/focus?since=${encodeURIComponent(range)}`, {
+        method: "POST",
+      });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload?.error ?? response.statusText);
+      setFailures((payload.judgments as JudgeResult[]).filter((result) => result.error));
+      onFinished();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setRunning(false);
+    }
+  }
+
+  return (
+    <div className="flex flex-col items-end gap-1">
+      <button
+        type="button"
+        onClick={runCheck}
+        disabled={running}
+        className="cursor-pointer rounded-full border border-hairline bg-surface px-4 py-2 text-sm text-ink-primary hover:border-[var(--series-1)] disabled:cursor-progress disabled:text-ink-muted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--series-1)]"
+      >
+        {running ? "Reading…" : "Check focus"}
+      </button>
+
+      {error ? <p className="text-xs text-critical">{error}</p> : null}
+
+      {failures.map((failure) => (
+        <p key={failure.personId} className="text-xs text-critical">
+          {failure.personId}: {failure.error}
+        </p>
+      ))}
+    </div>
+  );
+}
+
+function FocusPerson({
+  brief,
+  reading,
+  onSaved,
+}: {
+  brief: FocusBrief;
+  reading: StoredFocusReading | undefined;
+  onSaved: () => void;
+}) {
+  const alignment = reading ? ALIGNMENT[reading.payload.alignment] : null;
+  const shown = brief.assignments.slice(0, ASSIGNMENTS_SHOWN);
+  const hidden = brief.assignments.length - shown.length;
+
+  return (
+    <div className="border-b border-hairline pb-6 last:border-0 last:pb-0">
+      <div className="flex flex-wrap items-baseline justify-between gap-2">
+        <h3 className="text-sm font-semibold text-ink-primary">{brief.name}</h3>
+        <div className="flex items-center gap-3">
+          <span className="text-xs text-ink-muted tabular-nums">
+            {formatNumber(brief.events.length)} events
+          </span>
+          {alignment ? (
+            <span className="flex items-center gap-1.5 text-xs text-ink-secondary">
+              <span
+                aria-hidden="true"
+                className="inline-block h-2 w-2 rounded-full"
+                style={{ background: alignment.color }}
+              />
+              {alignment.label}
+            </span>
+          ) : null}
+        </div>
+      </div>
+
+      <FocusStatement brief={brief} onSaved={onSaved} />
+
+      <div className="mt-4 grid gap-4 md:grid-cols-2">
+        <div>
+          <h4 className="text-xs font-medium text-ink-secondary">Assigned in Linear</h4>
+          {shown.length ? (
+            <ul className="mt-2 space-y-1.5">
+              {shown.map((issue) => (
+                <li key={issue.identifier} className="text-xs">
+                  <a
+                    href={issue.url}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="text-ink-primary hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--series-1)]"
+                  >
+                    <span className="text-ink-secondary tabular-nums">{issue.identifier}</span>{" "}
+                    {issue.title}
+                  </a>
+                  <div className="text-ink-muted">
+                    {/* Capitalised here rather than in the shared labels: the model
+                        prompt wants them lower case, and a project name must not be
+                        re-cased by a rule meant for the priority beside it. */}
+                    <span className="capitalize">{priorityLabel(issue.priority)}</span> ·{" "}
+                    {issue.state}
+                    {issue.project_name ? ` · ${issue.project_name}` : ""}
+                    {issue.initiative_name ? ` · ${issue.initiative_name}` : ""}
+                    {issue.idle_days >= 2 ? ` · untouched ${issue.idle_days}d` : ""}
+                  </div>
+                </li>
+              ))}
+              {hidden > 0 ? (
+                <li className="text-xs text-ink-muted">{formatNumber(hidden)} more assigned.</li>
+              ) : null}
+            </ul>
+          ) : (
+            <p className="mt-2 text-xs text-ink-muted">Nothing open assigned to them.</p>
+          )}
+        </div>
+
+        <div>
+          <h4 className="text-xs font-medium text-ink-secondary">Reading</h4>
+          {reading ? (
+            <div className="mt-2 space-y-2 text-xs">
+              <p className="text-ink-primary">{reading.payload.workingOn}</p>
+
+              {reading.payload.untouched.length ? (
+                <p className="text-ink-secondary">
+                  <span className="text-ink-muted">No trace against:</span>{" "}
+                  {reading.payload.untouched.join(" · ")}
+                </p>
+              ) : null}
+
+              {reading.payload.unexplained.length ? (
+                <p className="text-ink-secondary">
+                  <span className="text-ink-muted">Outside the priorities:</span>{" "}
+                  {reading.payload.unexplained.join(" · ")}
+                </p>
+              ) : null}
+
+              {reading.payload.ask ? (
+                <p className="rounded-lg border border-hairline p-2 text-ink-primary">
+                  Worth asking: {reading.payload.ask}
+                </p>
+              ) : null}
+
+              <p className="text-ink-muted tabular-nums">
+                Read {formatTimestamp(reading.createdAt)} over{" "}
+                {reading.windowStart.slice(0, 10)} → {reading.windowEnd.slice(0, 10)}
+              </p>
+            </div>
+          ) : (
+            <p className="mt-2 text-xs text-ink-muted">
+              Not read yet. Check focus asks a model how the two lists line up.
+            </p>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function FocusCard({ repository }: { repository: string }) {
+  const [range, setRange] = useState(FOCUS_RANGES[0]!.value);
+  const [reloadToken, setReloadToken] = useState(0);
+  const reload = () => setReloadToken((token) => token + 1);
+
+  const { data, pending, error } = useJson<FocusPayload>(
+    `/api/focus?since=${encodeURIComponent(range)}&repo=${encodeURIComponent(repository)}` +
+      `&reload=${reloadToken}`,
+  );
+
+  const readingFor = new Map((data?.judgments ?? []).map((judgment) => [judgment.personId, judgment]));
+
+  return (
+    <Card
+      title="Daily focus"
+      description={
+        "What each person should be on, what they are assigned, and what actually surfaced — the " +
+        "three side by side. The stated focus is the only thing on this dashboard a person types " +
+        "rather than a collector finds, and it outranks the tracker when they disagree. Events are " +
+        "instants, so a priority with no trace against it means the work left none, not that it did " +
+        "not happen."
+      }
+    >
+      <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
+        <RadioGroup
+          value={range}
+          onChange={setRange}
+          aria-label="Focus window"
+          className="flex flex-wrap gap-1 rounded-full border border-hairline bg-surface p-1"
+        >
+          {FOCUS_RANGES.map((option) => (
+            <Radio
+              key={option.value}
+              value={option.value}
+              className="cursor-pointer rounded-full px-3 py-1.5 text-sm text-ink-secondary select-none hover:text-ink-primary data-[checked]:bg-[var(--series-1)] data-[checked]:text-white data-[focus]:outline-2 data-[focus]:outline-offset-2 data-[focus]:outline-[var(--series-1)]"
+            >
+              {option.label}
+            </Radio>
+          ))}
+        </RadioGroup>
+
+        <FocusCheckButton range={range} onFinished={reload} />
+      </div>
+
+      {error ? <p className="text-sm text-critical">{error}</p> : null}
+
+      {data ? (
+        <div className={`space-y-6 ${pending ? "opacity-60" : ""}`}>
+          {data.briefs.map((brief) => (
+            <FocusPerson
+              key={brief.personId}
+              brief={brief}
+              reading={readingFor.get(brief.personId)}
+              onSaved={reload}
+            />
+          ))}
+        </div>
+      ) : null}
+    </Card>
+  );
+}
+
 /* -------------------------------------------------------------- person panel */
 
 function PersonDialog({
@@ -1548,6 +1932,10 @@ function App() {
               <StatTile label="Messages" value={formatNumber(data.team.messages)} />
             </div>
           </div>
+
+          {/* Its own window and its own fetch: this asks about today, and every
+              card below it asks about the month on the filter row. */}
+          <FocusCard repository={repository} />
 
           <Card
             title="Activity"
