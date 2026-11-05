@@ -877,8 +877,8 @@ test("aiUsage: daily Claude Code rows are upserted, then summed per person", asy
 test("vercel scope: a slug and a real team id go in different parameters", () => {
   // `vercel teams ls` prints slugs under a column headed "id", so both shapes
   // reach .env — and sending a slug as teamId fails as "team not found".
-  const slug = scopeOf("flowlease-ai", new URL("https://api.vercel.com/v6/deployments"));
-  expect(slug.searchParams.get("slug")).toBe("flowlease-ai");
+  const slug = scopeOf("acme-team", new URL("https://api.vercel.com/v6/deployments"));
+  expect(slug.searchParams.get("slug")).toBe("acme-team");
   expect(slug.searchParams.get("teamId")).toBeNull();
 
   const id = scopeOf("team_abc123", new URL("https://api.vercel.com/v6/deployments"));
@@ -922,7 +922,7 @@ test("collectVercel: pages through deployments, credits by username then email",
   const stub = (handler: (input: string | URL) => Promise<Response>) =>
     Object.assign(handler, { preconnect: realFetch.preconnect }) as typeof fetch;
   process.env.VERCEL_TOKEN = "test-token";
-  process.env.VERCEL_TEAM_ID = "flowlease-ai";
+  process.env.VERCEL_TEAM_ID = "acme-team";
   globalThis.fetch = stub(async (input) => {
     requested.push(String(input));
     return new Response(JSON.stringify(pages.shift() ?? { deployments: [] }), { status: 200 });
@@ -937,7 +937,7 @@ test("collectVercel: pages through deployments, credits by username then email",
     expect(rows[0]?.title).toBe("deployed web to production");
     expect(rows[0]?.url).toBe("https://web.vercel.app");
     // The second request walks backwards from the first page's cursor.
-    expect(requested[0]).toContain("slug=flowlease-ai");
+    expect(requested[0]).toContain("slug=acme-team");
     expect(requested[1]).toContain("until=1759000000000");
 
     // A failed call is loud rather than an empty sync that reads as a quiet week.
@@ -978,7 +978,7 @@ test("formatDailyMessage: one running sequence across sections, empty ones left 
   const text = formatDailyMessage(
     {
       headline: "Mostly the exporter, plus the login fix landing.",
-      shipped: ["Login redirect fixed (FLO-88) — Maya"],
+      shipped: ["Login redirect fixed (ENG-88) — Maya"],
       inFlight: ["Exporter rewrite — Sam, behind the flag until Thursday"],
       waiting: [],
     },
@@ -988,7 +988,7 @@ test("formatDailyMessage: one running sequence across sections, empty ones left 
   expect(text).toContain("**Daily update — Sunday, Aug 9**");
   // Numbered across sections, not restarted per section, and never renumbered by
   // a model: 2 belongs to In flight because 1 was spent in Shipped.
-  expect(text).toContain("1. Login redirect fixed (FLO-88) — Maya");
+  expect(text).toContain("1. Login redirect fixed (ENG-88) — Maya");
   expect(text).toContain("2. Exporter rewrite — Sam, behind the flag until Thursday");
   // A heading with nothing under it is a question the reader has to answer.
   expect(text).not.toContain("Waiting");

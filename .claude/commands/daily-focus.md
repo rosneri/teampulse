@@ -81,8 +81,8 @@ Options must be concrete and actionable, 2–4 of them, the one you would pick f
 
 Good:
 
-> **Tomer — 3 days on the publish pipeline, nothing on FLO-503 (urgent, assigned)**
-> - `Ask him to land FLO-503 first (Recommended)` — it is the only urgent issue on his list and it has not moved in 3 days
+> **Tomer — 3 days on the publish pipeline, nothing on ENG-503 (urgent, assigned)**
+> - `Ask him to land ENG-503 first (Recommended)` — it is the only urgent issue on his list and it has not moved in 3 days
 > - `Restate his focus as the pipeline` — the tracker is wrong, not him; updates the stated focus to match what he is doing
 > - `Leave it — ask at standup` — costs a day, right if you think Linear is stale
 

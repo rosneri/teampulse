@@ -37,7 +37,7 @@ The identity map. One person, three handles, one canonical id:
 
 ```yaml
 github:
-  org: Flowlease
+  org: YourOrg
 slack:
   channels: [eng, product]
 people:
@@ -223,9 +223,9 @@ a PR and the Linear issue it closes are never both counted as one delivery.
 
 ## Known behavior
 
-`github.org` is a hard boundary. With `org: Flowlease` set, a merged PR in a
+`github.org` is a hard boundary. With `org: YourOrg` set, a merged PR in a
 personal repo or a second org is not counted and never will be — the collector
-searches `org:Flowlease` and nothing else. If the totals look low, that is the
+searches `org:YourOrg` and nothing else. If the totals look low, that is the
 first thing to check:
 
 ```bash
